@@ -1,4 +1,9 @@
-# Local development and tests only. Databricks serverless already provides pandas/numpy/pyspark.
+# Used by the Databricks App (installed automatically) and for local development/tests.
+# Databricks notebooks on serverless already provide pandas/numpy/pyspark.
 pandas>=2.0
 numpy>=1.24
+pyarrow>=14
+streamlit>=1.38
+databricks-sql-connector>=3.0
+databricks-sdk>=0.30
 pytest>=7.0

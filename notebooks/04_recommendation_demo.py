@@ -10,8 +10,10 @@
 # MAGIC 3. Set **max_distance_km** and **top_k** (how many results).
 # MAGIC 4. Click **Run all** (or re-run the cell under *Your search*). Results appear as cards, then as a table.
 # MAGIC
-# MAGIC Every result shows an **exact quote** from the facility's own listing, the score breakdown, a confidence level,
-# MAGIC and warnings. **Nothing here confirms that a service is available today. Always call ahead.**
+# MAGIC Every result shows an **exact quote** from the facility's own listing, an evidence category, identity and location
+# MAGIC checks, and the score breakdown. Records that fail a credibility gate are listed as *held back*, never recommended.
+# MAGIC **Nothing here confirms that a service is available today. Always call ahead.** The full referral workflow
+# MAGIC (Find, Compare, Verify, Refer) is in the CareProof Streamlit app (`app/`).
 
 # COMMAND ----------
 
@@ -44,10 +46,11 @@ def gold_for(service_key):
     if service_key not in _GOLD_CACHE:
         g = spark_to_pandas_str(spark.table(tbl(cfg, "facility_service_gold").replace("`", ""))
                                 .where(F.col("service") == service_key))
-        for c in ("location_lat", "location_lon", "location_quality_score", "service_match_score",
-                  "evidence_confidence_score", "readiness_score", "facility_to_pin_km"):
+        for c in ("location_lat", "location_lon", "location_quality_score", "location_confidence_score", "identity_confidence_score",
+                  "service_relevance_score", "corroboration_score", "evidence_strength_score", "readiness_evidence_score",
+                  "facility_to_pin_km", "n_distinct_statements"):
             g[c] = pd.to_numeric(g[c], errors="coerce")
-        for c in ("is_candidate", "baseline_keyword_hit", "baseline_exact_term_hit"):
+        for c in ("is_candidate", "eligible", "has_description_statement", "baseline_keyword_hit", "baseline_exact_term_hit"):
             g[c] = g[c] == "true"
         _GOLD_CACHE[service_key] = g
     return _GOLD_CACHE[service_key]
@@ -71,11 +74,13 @@ def run_query(service_text, location_type, location_value="", lat="", lon="", ma
     return results, summary, baseline, loc
 
 def results_table(results):
-    cols = ["rank", "facility_name", "address", "distance_km", "confidence", "final_score", "service_match_score",
-            "evidence_confidence_score", "location_quality_score", "distance_score", "readiness_score",
-            "data_quality_penalty", "evidence_field", "evidence_excerpt", "source_url", "facility_id"]
+    cols = ["rank", "facility_name", "address", "distance_km", "evidence_label", "availability_status",
+            "final_ranking_score", "service_relevance_score", "evidence_strength_score", "identity_confidence_score",
+            "location_confidence_score", "readiness_evidence_score", "distance_score", "data_quality_penalty",
+            "evidence_field", "evidence_excerpt", "source_url", "facility_id", "source_row_id", "pipeline_version"]
     df = pd.DataFrame([{**{c: r[c] for c in cols}, "matched_terms": ", ".join(r["matched_terms"]),
-                        "warnings": " | ".join(r["contradiction_warnings"] + r["missing_data_warnings"])} for r in results])
+                        "warnings": " | ".join(r["identity_warnings"] + r["location_warnings"] + r["missing_data_warnings"])}
+                       for r in results])
     return df
 
 def show(pdf):
@@ -91,7 +96,8 @@ def baseline_compare(results, baseline):
         c = cp.get(b["facility_id"])
         rows.append({"baseline_rank": b["rank"], "facility_name": b["facility_name"], "distance_km": b["distance_km"],
                      "baseline_evidence_level": b["evidence_level"],
-                     "careproof_rank": c["rank"] if c else None, "careproof_confidence": c["confidence"] if c else "not recommended",
+                     "careproof_rank": c["rank"] if c else None,
+                     "careproof_evidence": c["evidence_label"] if c else "not recommended (failed a credibility gate)",
                      "flags": ", ".join(b["flags"])})
     return pd.DataFrame(rows)
 
@@ -157,7 +163,7 @@ a = run_query("dialysis", "pincode", "800001", max_km=25, top_k=3, title="A · S
 # MAGIC %md ## B. Weak / contradictory evidence: dialysis at the location of a merged record
 # MAGIC The record named *Aravind Eye Hospital* (an eye hospital) lists a **20-bed dialysis unit**, gives a Delhi PIN,
 # MAGIC a Hyderabad city, and coordinates in Puducherry. A keyword search puts it first. CareProof keeps the quote
-# MAGIC visible but labels it **Low confidence** and explains every contradiction.
+# MAGIC visible in the *held back* list, never as a recommendation, and **abstains** with an explicit message.
 
 # COMMAND ----------
 

@@ -1,42 +1,39 @@
-# CareProof India
+# CareProof India: Referral Navigator
 
-**An evidence-aware healthcare facility recommender for India.**
+**An evidence-aware healthcare referral application for India.**
 Enter a service (dialysis, emergency C-section, NICU, MRI, cardiac surgery, burn care, trauma) and a location
-(PIN code, district, city, or coordinates). CareProof returns ranked facilities. Each result comes with an **exact quote
-from the facility's own listing**, a transparent score breakdown, a confidence label, and warnings about missing or
-contradictory data.
+(PIN code, district, city, or coordinates). CareProof returns the **most credibly documented** nearby facilities.
+For each one it shows the **exact quote from the facility's own record**, an evidence category, identity and
+location checks, transparent component scores, alternatives, and a call-ahead checklist. When nothing qualifies,
+it **abstains**.
 
 > **The nearest claimed provider is not necessarily the nearest credibly supported provider.**
 
-CMU Datathon Fall 2026 · runs on **Databricks Free Edition (serverless)** · Python, PySpark and Spark SQL only.
+CMU Datathon Fall 2026 · runs on **Databricks Free Edition (serverless)** · Python, PySpark, Spark SQL ·
+Streamlit Databricks App.
 
 ---
 
-## What it does
+## How it decides (WHY this facility, HOW it was ranked)
 
-1. **Retrieve.** Find facilities whose own free text (procedure / equipment / capability / description / name)
-   explicitly states the service. Specialty tags such as `nephrology` or `gynecologyAndObstetrics` count only as
-   supporting context. Negated or planned mentions ("MRI not available", "trauma centre under construction")
-   count as contradictions.
-2. **Rank transparently.**
-   `final = Σ weight × component − data_quality_penalty`, clamped to [0, 1]. The components are
-   `service_match_score`, `evidence_confidence_score`, `location_quality_score`, `distance_score` and
-   `readiness_score`. The weights are **policy choices** listed in [`config.py`](src/careproof/config.py). They are
-   not learned. Notebook 05 tests how sensitive the ranking is to them.
-3. **Explain.** Each result includes the facility ID, name, address, approximate straight-line distance, all
-   scores, matched terms and fields, the exact excerpt, the source URL, a confidence label (High / Medium / Low),
-   missing-data warnings, contradiction warnings, a plain-language explanation, and a **verify-before-travel**
-   warning.
+Every field in the source data is an LLM-extracted **claim**, not a fact. CareProof:
 
-Checks that catch merged or unreliable records:
-
-* Facility coordinates vs. the centroid of the facility's own PIN code (> 25 km away = `location_conflict`).
-* Stated state vs. the PIN code's state (`state_conflict`).
-* Facility name or type vs. the claimed service, e.g. an eye hospital claiming a dialysis unit (`specialty_mismatch`).
-* Negated or planned mentions (`negated_mention`), login or payment pages among the source URLs
-  (`suspicious_source_url`), and near-duplicate records (`possible_duplicate`).
-
----
+1. **Retrieves** records that mention the service, and copies the supporting passage **verbatim**.
+2. **Checks the claim.** Negated, planned, historical, referral or tie-up language ("referred to…", "under
+   construction", "through tie-up with…") counts as a contradiction. A passage about a **different named
+   facility** is not evidence for this one.
+3. **Checks the record**: identity (does the description describe a different hospital? duplicates? provenance?) and
+   location (coordinates vs its own PIN, state vs PIN, placeholder coordinates, ambiguous PINs).
+4. **Categorises the evidence**: strong / moderate / weak / conflicting / insufficient
+   ([evidence policy](docs/evidence_policy.md)).
+5. Applies **hard eligibility gates** *before* ranking. Conflicting or insufficient evidence, low location or identity
+   confidence, probable merged records and missing excerpts are never recommended; they go to
+   `careproof_facilities_quarantine` with reason codes ([quarantine rules](docs/quarantine_rules.md)).
+6. **Ranks eligible candidates only** using separate components (service relevance, evidence strength, identity
+   confidence, location confidence, readiness evidence, distance, data-quality penalty). The weights are policy
+   choices in [`config.py`](src/careproof/config.py), not learned. Distance never rescues an ineligible record.
+7. **Shows alternatives**, and gives a service-specific **verification checklist** and a printable **referral
+   summary**. Current availability is **never** inferred: it reads "not verified" until the user confirms it by phone.
 
 ## Quick start on Databricks Free Edition
 
@@ -61,9 +58,25 @@ In Databricks, open **Marketplace** and search for *Virtue Foundation* (the DAIS
 | 03 | `notebooks/03_build_gold` | writes `careproof_facility_service_gold` | 1–3 min |
 | 03b | `notebooks/03b_exploratory_analysis` | question-driven EDA and data-quality analysis on the Marketplace data (read-only) | 1–2 min |
 | 04 | `notebooks/04_recommendation_demo` | **the interface**: widgets → result cards + tables + baseline comparison + NFHS context + guided scenarios | < 1 min |
+| app | **CareProof Referral Navigator** (Databricks App, `app/app.py`) | Find · Compare · Verify · Refer, the main user interface | see below |
 | 05 | `notebooks/05_evaluation` | curated benchmark + seeded random sample; baselines B1–B4; latency p50/p95; blind labeling template | 2–4 min |
 
 Then, optionally, run [`sql/validation_queries.sql`](sql/validation_queries.sql) in the SQL editor.
+
+### Deploy the Referral Navigator app (after notebooks 02 and 03)
+1. **Compute → Apps → Create app → Custom**. Name it `careproof-navigator`.
+2. Add a resource: **SQL warehouse** (the Free Edition *Serverless Starter Warehouse*), permission *Can use*,
+   resource key **`sql-warehouse`** (this must match `app.yaml`).
+3. Create the app. Then **Deploy** with source code path = this Git folder's root (e.g.
+   `/Workspace/Users/<you>/datathon`). `app.yaml` and `requirements.txt` are at the root.
+4. Grant the app's service principal read access (shown on the app page as *Service principal*). In a SQL editor:
+   ```sql
+   GRANT USE CATALOG ON CATALOG workspace TO `<app-service-principal-id>`;
+   GRANT USE SCHEMA ON SCHEMA workspace.careproof_india TO `<app-service-principal-id>`;
+   GRANT SELECT ON SCHEMA workspace.careproof_india TO `<app-service-principal-id>`;
+   ```
+5. Open the app URL. Run locally against Parquet with
+   `CAREPROOF_LOCAL_DATA=data/derived streamlit run app/app.py`.
 
 ### Configuration (widgets, shown at the top of every notebook)
 
@@ -112,7 +125,7 @@ Alternatively, run 02 and 03 with `rebuild_tables = yes`, which overwrites the t
 ```bash
 uv venv --python 3.12 .venv && source .venv/bin/activate   # or python3.12 -m venv .venv
 pip install -r requirements.txt
-python -m pytest -q tests                                  # 91 tests
+python -m pytest -q tests                                  # 139 tests (incl. headless Streamlit app tests)
 # put the CSV exports in data/raw/ (see data/README.md), then:
 python scripts/run_local.py build                          # ~1.5 min, writes Parquet to data/derived/
 python scripts/make_eda_report.py                          # regenerates docs/data_quality_report.md + figures
@@ -137,27 +150,25 @@ keyword baseline; benchmark with automatic metrics; HTML result cards.
 **Implemented, Databricks run pending:** notebooks 00–05 and the SQL validation queries. They were written against
 the local schema; notebook 01 reports any schema differences on Databricks.
 
-**Measured** (local CSV run; to be re-measured on Databricks in notebook 05). Headline numbers come from a
-**seeded, stratified random sample** of 56 queries (7 services × 4 district-rurality quartiles), frozen before
-results were inspected and split dev/test by state:
+**Measured** (local CSV build, 2026-11-21; re-measure on Databricks in notebook 05). Random sample of 56 queries
+(seeded, stratified by service × district rurality, split dev/test by state):
 
 | Metric | Value |
 |---|---|
-| Citation correctness (excerpt is an exact substring of the cited field) | 187 / 187 |
-| Geographic validity (within radius, inside India, distance recomputes) | 187 / 187 |
-| Coverage (queries with ≥1 result) | 46 / 56; the 10 abstentions are mostly in rural quartiles |
-| CareProof top-1 differs from the nearest-synonym baseline | 29 / 56 |
-| Nearest-synonym baseline results that are tag-only, negated or contradicted | 57 / 188 |
-| Top-1 unchanged under 4 alternative weight policies | 47–52 / 56 |
-| Latency per query (warm, local) | p50 8.6 ms · p95 20.1 ms |
-| **Precision@K, NDCG@K, calibration** | **PENDING HUMAN REVIEW** (blind labeling template generated) |
+| **Unsupported recommendation rate** (shown results failing the evidence gates) | nearest-synonym baseline **33.0%** · exact-word baseline 31.7% · CareProof 0% (by construction) |
+| Coverage (queries with ≥1 eligible result) | 46 / 56; of 10 abstentions, 6 had mentions that were all held back |
+| Exact-substring citations · valid locations | 169 / 169 · 169 / 169 |
+| Results by evidence category | 43 strong · 84 moderate · 42 weak |
+| Top-1 unchanged under 4 alternative weight policies | 45–52 / 56 |
+| Latency per query (warm, local) | p50 16.6 ms · p95 26.2 ms |
+| **Precision@K, quarantine precision/recall, retrieval recall** | **PENDING HUMAN REVIEW** (142-pair blind review sheet + query labeling template) |
 
-These label-free numbers measure **evidence-policy compliance and behaviour, not correctness.** For example,
-CareProof's 100% explicit-evidence rate is true by construction. Correctness claims wait for human labels
-(see [`docs/labeling_rubric.md`](docs/labeling_rubric.md)). The 23-query curated benchmark tests edge-case
-behaviour (22/23 as expected). It is not an unbiased estimate.
+CareProof's 0% unsupported rate is by construction. The baselines' rates are the informative numbers.
 
-Further documentation: [EDA / data-quality report](docs/data_quality_report.md) · [problem spec](docs/problem_spec.md) ·
+Further documentation: [evidence policy](docs/evidence_policy.md) · [quarantine rules](docs/quarantine_rules.md) ·
+[confidence semantics](docs/confidence_semantics.md) · [referral workflow](docs/referral_workflow.md) ·
+[evaluation protocol](docs/evaluation_protocol.md) · [safety & limitations](docs/safety_and_limitations.md) ·
+[EDA / data-quality report](docs/data_quality_report.md) · [problem spec](docs/problem_spec.md) ·
 [literature review](docs/literature_review.md) · [decision log](docs/decision_log.md) · [system card](docs/system_card.md)
 
 **Heuristic decisions (policy, not learned):** all weights, penalties, confidence thresholds, the 15 km distance

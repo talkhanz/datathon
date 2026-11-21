@@ -4,6 +4,7 @@ data/derived/*
 *.csv
 !evaluation/benchmark_queries.csv
 !evaluation/labeling_queries_v1.csv
+!evaluation/pair_benchmark_v1.csv
 *.parquet
 *.pkl
 evaluation/*_LOCAL.csv

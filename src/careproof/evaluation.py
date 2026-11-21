@@ -41,10 +41,11 @@ def run_benchmark(queries: pd.DataFrame, gold: pd.DataFrame, silver: pd.DataFram
                           "location_warning": None})
             continue
         maxkm, k = float(q["max_distance_km"]), int(q["top_k"])
-        runs = {name: recommend(gold, loc, svc, maxkm, k, w)[0] for name, w in WEIGHT_SCENARIOS.items()}
-        res = runs["default"]
+        full = {name: recommend(gold, loc, svc, maxkm, k, w) for name, w in WEIGHT_SCENARIOS.items()}
+        runs = {name: v[0] for name, v in full.items()}
+        res, summ = full["default"]
         bl = keyword_baseline(gold, loc, svc, maxkm, k)
-        exp_ok = None if q["expected_outcome"] == "unknown" else (
+        exp_ok = None if q["expected_outcome"] == "unknown" else (q["expected_outcome"] == "abstain" and not res) or (
             (q["expected_outcome"] == "results" and len(res) > 0) or
             (q["expected_outcome"] == "results_with_warning" and len(res) > 0 and bool(loc.warnings)))
         default_ids = [r["facility_id"] for r in res]
@@ -63,8 +64,11 @@ def run_benchmark(queries: pd.DataFrame, gold: pd.DataFrame, silver: pd.DataFram
                       "outcome_as_expected": exp_ok, "location_warning": bool(loc.warnings),
                       "citations_exact": sum(cites), "citations_total": len(cites),
                       "geo_valid": sum(geo), "geo_total": len(geo),
-                      "n_high": sum(r["confidence"] == "High" for r in res),
-                      "n_low": sum(r["confidence"] == "Low" for r in res),
+                      "n_strong": sum(r["evidence_category"] == "strong" for r in res),
+                      "n_moderate": sum(r["evidence_category"] == "moderate" for r in res),
+                      "n_weak": sum(r["evidence_category"] == "weak" for r in res),
+                      "retrieved_mentions": summ["retrieved_mentions_in_radius"],
+                      "held_back": summ["held_back_in_radius"],
                       "cp_with_contradiction_flags": sum(bool(CONTRA & set(r["flags"])) for r in res),
                       "baseline_n": len(bl), "baseline_weak_or_contradictory": len(bl_weak),
                       "baseline_top1_weak": bool(bl and bl[0] in bl_weak),
@@ -77,7 +81,8 @@ def run_benchmark(queries: pd.DataFrame, gold: pd.DataFrame, silver: pd.DataFram
                 label_rows.append({
                     "query_id": q["query_id"], "service": svc, "location": loc.label, "system": system,
                     "rank": r["rank"], "facility_id": r["facility_id"], "facility_name": r["facility_name"],
-                    "distance_km": r["distance_km"], "confidence": r.get("confidence", "n/a (baseline)"),
+                    "distance_km": r["distance_km"], "evidence_category": g["evidence_category"],
+                    "eligible_under_policy": bool(g["eligible"]),
                     "evidence_field": g["evidence_field"], "evidence_excerpt": g["evidence_excerpt"],
                     "flags": json.dumps(r["flags"]), "source_url": row.get("primary_source_url"),
                     "label_service_supported (yes/no/unclear)": "", "reviewer": "", "notes": "",
@@ -85,9 +90,10 @@ def run_benchmark(queries: pd.DataFrame, gold: pd.DataFrame, silver: pd.DataFram
                 })
         for r in res:
             rrows.append({"query_id": q["query_id"], **{k: r[k] for k in (
-                "rank", "facility_id", "facility_name", "distance_km", "final_score", "confidence",
-                "service_match_score", "evidence_confidence_score", "location_quality_score", "distance_score",
-                "readiness_score", "data_quality_penalty", "evidence_field", "evidence_excerpt")}})
+                "rank", "facility_id", "source_row_id", "facility_name", "distance_km", "final_ranking_score",
+                "evidence_category", "service_relevance_score", "evidence_strength_score", "identity_confidence_score",
+                "location_confidence_score", "readiness_evidence_score", "distance_score", "data_quality_penalty",
+                "evidence_field", "evidence_excerpt", "pipeline_version")}})
     return pd.DataFrame(qrows), pd.DataFrame(rrows), pd.DataFrame(label_rows)
 
 
@@ -106,10 +112,12 @@ def summarize(qdf: pd.DataFrame) -> dict:
                                 else "n/a (no expected outcomes: unbiased random sample)"),
         "coverage_queries_with_results": f"{int((ok.n_results > 0).sum())}/{len(qdf)}",
         "coverage_answerable_queries_with_results": f"{int((ans.n_results > 0).sum())}/{len(ans)}",
-        "abstained_no_evidence_in_radius": int(((qdf.status == "ok") & (qdf.n_results == 0)).sum()),
+        "abstained_no_eligible_in_radius": int(((qdf.status == "ok") & (qdf.n_results == 0)).sum()),
+        "abstentions_with_mentions_held_back": int(((qdf.status == "ok") & (qdf.n_results == 0) & (qdf.get("retrieved_mentions", 0) > 0)).sum()),
         "citation_exact_substring_rate": _rate(ok.citations_exact.sum(), ok.citations_total.sum()),
         "geographic_validity_rate": _rate(ok.geo_valid.sum(), ok.geo_total.sum()),
         "careproof_results_with_contradiction_flags": f"{int(ok.cp_with_contradiction_flags.sum())}/{int(ok.n_results.sum())}",
+        "careproof_results_by_category": {c: int(ok[f"n_{c}"].sum()) for c in ("strong", "moderate", "weak") if f"n_{c}" in ok},
         "baseline_results_weak_or_contradictory": f"{int(ok.baseline_weak_or_contradictory.sum())}/{int(ok.baseline_n.sum())}",
         "baseline_top1_weak_queries": f"{int(ok.baseline_top1_weak.sum())}/{len(ok)}",
         "top1_differs_from_baseline": f"{int(ok.top1_differs_from_baseline.sum())}/{len(ok)}",
@@ -149,7 +157,8 @@ def _run_system(name, gold, silver, loc, svc, maxkm, k):
 def compare_baselines(queries: pd.DataFrame, gold: pd.DataFrame, silver: pd.DataFrame, index, repeats: int = 3):
     """Per-system label-free metrics over answerable queries + latency (p50/p95 over repeats x queries)."""
     gsvc = {s: gold[gold.service == s] for s in gold.service.unique()}
-    status = {(r.facility_id, r.service): (r.evidence_level, json.loads(r.flags_json)) for r in gold.itertuples()}
+    status = {(r.facility_id, r.service): (r.evidence_level, json.loads(r.flags_json), bool(r.eligible))
+              for r in gold.itertuples()}
     rows, lat = [], {s: [] for s in SYSTEMS}
     for q in queries.to_dict("records"):
         svc = resolve_service(q["service_input"]).key
@@ -166,30 +175,33 @@ def compare_baselines(queries: pd.DataFrame, gold: pd.DataFrame, silver: pd.Data
                 t0 = _time.perf_counter()
                 res = _run_system(name, g, silver, loc, svc, maxkm, k)
                 lat[name].append((_time.perf_counter() - t0) * 1000)
-            lv = [status.get((r["facility_id"], svc), ("no_signal", []))[0] for r in res]
-            fl = [status.get((r["facility_id"], svc), ("no_signal", []))[1] for r in res]
+            st = [status.get((r["facility_id"], svc), ("no_signal", [], False)) for r in res]
+            lv, fl, el = [x[0] for x in st], [x[1] for x in st], [x[2] for x in st]
             rows.append({"query_id": q["query_id"], "system": name, "n_results": len(res),
                          "n_explicit_evidence": sum(v == "explicit_text" for v in lv),
                          "n_no_or_tag_only_evidence": sum(v in ("no_signal", "none", "specialty_tag_only") for v in lv),
                          "n_negated": sum(v == "negated_only" for v in lv),
                          "n_contradiction_flag": sum(bool(CONTRA & set(f)) for f in fl),
-                         "top1_explicit_clean": bool(res) and lv[0] == "explicit_text" and not (CONTRA & set(fl[0]))})
+                         "n_unsupported": sum(not e for e in el),
+                         "top1_explicit_clean": bool(res) and el[0]})
     per = pd.DataFrame(rows)
     agg = per.groupby("system").agg(queries=("query_id", "nunique"), results=("n_results", "sum"),
                                     coverage=("n_results", lambda x: (x > 0).mean()),
                                     explicit=("n_explicit_evidence", "sum"), weak=("n_no_or_tag_only_evidence", "sum"),
                                     negated=("n_negated", "sum"), contra=("n_contradiction_flag", "sum"),
+                                    unsupported=("n_unsupported", "sum"),
                                     top1_clean=("top1_explicit_clean", "mean")).reindex(list(SYSTEMS))
+    agg["unsupported_recommendation_rate_pct"] = (100 * agg.unsupported / agg.results).round(1)
     agg["pct_results_with_explicit_evidence"] = (100 * agg.explicit / agg.results).round(1)
     agg["pct_results_no_or_tag_only_evidence"] = (100 * agg.weak / agg.results).round(1)
     agg["pct_results_with_contradiction"] = (100 * agg.contra / agg.results).round(1)
-    agg["pct_top1_explicit_and_uncontradicted"] = (100 * agg.top1_clean).round(1)
+    agg["pct_top1_passes_evidence_gates"] = (100 * agg.top1_clean).round(1)
     agg["coverage_pct"] = (100 * agg.coverage).round(1)
     agg["latency_ms_p50"] = [round(float(np.percentile(lat[s], 50)), 2) for s in agg.index]
     agg["latency_ms_p95"] = [round(float(np.percentile(lat[s], 95)), 2) for s in agg.index]
-    keep = ["queries", "results", "coverage_pct", "pct_results_with_explicit_evidence",
-            "pct_results_no_or_tag_only_evidence", "negated", "pct_results_with_contradiction",
-            "pct_top1_explicit_and_uncontradicted", "latency_ms_p50", "latency_ms_p95"]
+    keep = ["queries", "results", "coverage_pct", "unsupported_recommendation_rate_pct",
+            "pct_results_with_explicit_evidence", "pct_results_no_or_tag_only_evidence", "negated",
+            "pct_results_with_contradiction", "pct_top1_passes_evidence_gates", "latency_ms_p50", "latency_ms_p95"]
     return agg[keep].reset_index(), per
 
 
@@ -258,3 +270,93 @@ def make_labeling_queries(pin_silver: pd.DataFrame, pin_raw: pd.DataFrame, per_c
                              "split": "test" if r.primary_state in test_states else "dev",
                              "notes": f"seed={seed}; frozen before inspecting results"})
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Facility-service PAIR benchmark (manual review of evidence, identity, location, eligibility, quarantine)
+# ---------------------------------------------------------------------------
+PAIR_LABEL_COLUMNS = ["label_service_relevant", "label_evidence_strength", "label_identity_consistent",
+                      "label_location_consistent", "label_eligible_for_recommendation", "label_quarantine_reason",
+                      "reviewer_confidence", "reviewer", "reviewer_2", "notes"]
+
+
+def _stratum(r) -> str:
+    f = r["facility_findings_json"] + r["claim_findings_json"]
+    if '"MULTIPLE_FACILITY_IDENTITIES"' in f:
+        return "merged_or_misattributed"
+    if '"SERVICE_CONTRADICTION"' in f:
+        return "negation_or_non_current"
+    if '"COORDINATE_LOCATION_CONFLICT"' in f or '"MULTIPLE_INCOMPATIBLE_LOCATIONS"' in f:
+        return "geographic_contradiction"
+    if '"UNRESOLVED_LOCATION"' in f:
+        return "missing_coordinates"
+    if '"AMBIGUOUS_PIN"' in f:
+        return "ambiguous_pin"
+    if r["evidence_level"] == "specialty_tag_only":
+        return "hard_negative_tag_only"
+    if r["evidence_level"] == "none":
+        return "hard_negative_keyword_only"
+    return f"evidence_{r['evidence_category']}"
+
+
+def make_pair_benchmark(gold: pd.DataFrame, per_cell: int = 2, seed: int = LABELING_SEED) -> pd.DataFrame:
+    """Seeded stratified sample of (facility, service) pairs: service x stratum, `per_cell` each.
+
+    Returns IDs + stratum + split only (no source text) so the file can be committed; the review sheet with
+    excerpts is produced at runtime by `pair_review_sheet`.
+    """
+    g = gold.copy()
+    g["stratum"] = g.apply(_stratum, axis=1)
+    rng = np.random.default_rng(seed)
+    rows = []
+    for (svc, stratum), d in sorted(g.groupby(["service", "stratum"]), key=lambda x: x[0]):
+        d = d.sort_values("facility_id")
+        pick = d.iloc[rng.choice(len(d), size=min(per_cell, len(d)), replace=False)]
+        for r in pick.itertuples():
+            rows.append({"pair_id": f"P{len(rows) + 1:04d}", "facility_id": r.facility_id, "service": svc,
+                         "stratum": stratum, "system_eligible_at_sampling": bool(r.eligible)})
+    out = pd.DataFrame(rows)
+    st = sorted(gold.address_stateOrRegion.fillna("").unique())
+    rng.shuffle(st)
+    test_states = set(st[: int(round(0.3 * len(st)))])
+    state = gold.set_index("facility_id").address_stateOrRegion.to_dict()
+    out["split"] = out.facility_id.map(lambda f: "test" if state.get(f) in test_states else "dev")
+    return out
+
+
+def pair_review_sheet(pairs: pd.DataFrame, gold: pd.DataFrame, silver: pd.DataFrame) -> pd.DataFrame:
+    """Blind review sheet: source evidence + system outputs hidden in separate columns reviewers should not see first."""
+    g = gold.set_index(["facility_id", "service"])
+    s = silver.set_index("facility_id")
+    rows = []
+    for p in pairs.itertuples():
+        gr, sr = g.loc[(p.facility_id, p.service)], s.loc[p.facility_id]
+        rows.append({"pair_id": p.pair_id, "split": p.split, "service": p.service, "facility_name": sr["name"],
+                     "address": ", ".join(str(x) for x in [sr["address_line1"], sr["address_city"],
+                                                          sr["address_stateOrRegion"], sr["address_zipOrPostcode"]]),
+                     "description": sr["description"], "evidence_excerpt": gr["evidence_excerpt"],
+                     "evidence_field": gr["evidence_field"], "source_url": sr["primary_source_url"],
+                     **{c: "" for c in PAIR_LABEL_COLUMNS},
+                     "HIDDEN_system_category": gr["evidence_category"], "HIDDEN_system_eligible": bool(gr["eligible"]),
+                     "HIDDEN_system_failed_gates": gr["failed_gates_json"], "HIDDEN_stratum": p.stratum})
+    return pd.DataFrame(rows).sample(frac=1, random_state=LABELING_SEED)
+
+
+def pair_metrics(sheet: pd.DataFrame) -> dict:
+    """Safety metrics from a reviewed pair sheet. Returns PENDING until labels exist."""
+    lab = sheet[sheet["label_eligible_for_recommendation"].astype(str).str.lower().isin(["yes", "no"])]
+    if lab.empty:
+        return {"status": "PENDING_HUMAN_REVIEW", "labeled_pairs": 0}
+    y = lab["label_eligible_for_recommendation"].str.lower() == "yes"
+    p = lab["HIDDEN_system_eligible"].astype(str).str.lower() == "true"
+    rel = lab["label_service_relevant"].astype(str).str.lower() == "yes"
+    retrieved = lab["evidence_excerpt"].notna()
+    return {
+        "labeled_pairs": int(len(lab)),
+        "unsupported_recommendation_rate": round(float((p & ~y).sum() / max(1, p.sum())), 3),
+        "eligibility_precision": round(float((p & y).sum() / max(1, p.sum())), 3),
+        "eligibility_recall": round(float((p & y).sum() / max(1, y.sum())), 3),
+        "quarantine_precision": round(float((~p & ~y).sum() / max(1, (~p).sum())), 3),
+        "quarantine_recall": round(float((~p & ~y).sum() / max(1, (~y).sum())), 3),
+        "retrieval_recall_of_relevant": round(float((rel & retrieved).sum() / max(1, rel.sum())), 3),
+    }

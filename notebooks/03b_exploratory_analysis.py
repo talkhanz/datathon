@@ -28,7 +28,7 @@ fac_raw = spark_to_pandas_str(spark.table(SOURCE_TABLES["facilities"].replace("`
 pin_raw = spark_to_pandas_str(spark.table(SOURCE_TABLES["pincode"].replace("`", "")))
 silver = load("facilities_silver", ["facility_lat", "facility_lon", "facility_to_pin_km", "location_lat", "location_lon",
                                     "n_exact_source_copies"], ["possible_duplicate"])
-quarantine = (load("facilities_quarantine") if table_exists(tbl(cfg, "facilities_quarantine")) else pd.DataFrame())
+quarantine = (load("facilities_rejected_rows") if table_exists(tbl(cfg, "facilities_rejected_rows")) else pd.DataFrame())
 pin_silver = load("pincode_silver", ["n_districts", "n_states"], ["coords_defensible", "is_ambiguous", "missing_coordinates"])
 nfhs_silver = load("nfhs_silver", ["value"], ["is_suppressed", "is_small_sample"])
 gold = load("facility_service_gold", [], ["is_candidate"])
@@ -110,7 +110,7 @@ def first(df, col, row_label, label_col):
     return None if m.empty else m.iloc[0][col]
 
 summary = {
-    "silver_facilities": len(silver), "quarantined": len(quarantine),
+    "silver_facilities": len(silver), "corrupted_rows_rejected": len(quarantine),
     "pct_far_from_own_pin_gt25km": round(float(R["Q3b"][R["Q3b"].facility_to_own_PIN_centroid.isin(["25-100 km", "100-500 km", ">500 km"])].pct.sum()), 1),
     "pct_candidates_any_contradiction": first(R["Q4b"], "pct_of_candidates", "ANY of location/state/specialty/negation", "flag"),
     "explicit_share_by_service": dict(zip(R["Q4a"].service, R["Q4a"].explicit_share_of_any_signal_pct)),

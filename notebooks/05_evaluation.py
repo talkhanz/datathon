@@ -39,10 +39,11 @@ for c in ("coords_defensible", "is_ambiguous"):
     pin[c] = pin[c] == "true"
 index = pipeline.place_index_from_pin_silver(pin)
 gold = spark_to_pandas_str(spark.table(tbl(cfg, "facility_service_gold").replace("`", "")))
-for c in ("location_lat", "location_lon", "location_quality_score", "service_match_score", "evidence_confidence_score",
-          "readiness_score", "facility_to_pin_km"):
+for c in ("location_lat", "location_lon", "location_quality_score", "location_confidence_score", "identity_confidence_score",
+                  "service_relevance_score", "corroboration_score", "evidence_strength_score", "readiness_evidence_score",
+                  "facility_to_pin_km", "n_distinct_statements"):
     gold[c] = pd.to_numeric(gold[c], errors="coerce")
-for c in ("is_candidate", "baseline_keyword_hit", "baseline_exact_term_hit"):
+for c in ("is_candidate", "eligible", "has_description_statement", "baseline_keyword_hit", "baseline_exact_term_hit"):
     gold[c] = gold[c] == "true"
 silver = spark_to_pandas_str(spark.table(tbl(cfg, "facilities_silver").replace("`", "")))
 for c in ("location_lat", "location_lon"):
@@ -101,3 +102,23 @@ print("label metrics:", label_metrics(lab).to_dict("records"))
 
 stab_cols = ["query_id", "service"] + [c for c in lqdf.columns if c.startswith(("jaccard_", "top1_same_"))]
 display(pandas_to_spark(lqdf[lqdf.status == "ok"][stab_cols]))
+
+# COMMAND ----------
+
+# MAGIC %md ## 5. Facility-service pair benchmark (blind review sheet for safety metrics)
+# MAGIC 142 seeded, stratified pairs (`evaluation/pair_benchmark_v1.csv`): strong/moderate/weak/conflicting evidence, tag-only
+# MAGIC and keyword-only hard negatives, negation, merged/misattributed records, geographic contradictions, missing coordinates,
+# MAGIC ambiguous PINs. Reviewers fill the `label_*` columns **without looking at** the `HIDDEN_*` columns.
+
+# COMMAND ----------
+
+from careproof.evaluation import pair_metrics, pair_review_sheet
+config.TABLES["pair_review"] = "careproof_eval_pair_review_sheet"
+pairs = pd.read_csv(os.path.join(root, "evaluation", "pair_benchmark_v1.csv"), dtype=str, keep_default_na=False)
+for c in ("identity_confidence_score", "location_confidence_score"):
+    silver[c] = pd.to_numeric(silver.get(c), errors="coerce")
+present = pairs.merge(gold[["facility_id", "service"]], on=["facility_id", "service"])
+print(f"{len(present)}/{len(pairs)} benchmark pairs present in the Databricks gold table")
+sheet = pair_review_sheet(present, gold, silver)
+safe_write(pandas_to_spark(sheet.astype(str)), cfg, "pair_review", "Blind pair review sheet. PENDING_HUMAN_REVIEW.")
+print("pair metrics:", pair_metrics(sheet))

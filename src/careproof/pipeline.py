@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -15,13 +16,21 @@ import numpy as np
 import pandas as pd
 
 from .config import DEFAULT_WEIGHTS, LOCATION_CONFLICT_KM, ScoringWeights, VERIFICATION_WARNING
+from .credibility import (
+    AMBIGUOUS_PIN, COORDINATE_LOCATION_CONFLICT, HIGH, LOW, MEDIUM, MISSING_SOURCE_PROVENANCE,
+    MULTIPLE_FACILITY_IDENTITIES, MULTIPLE_INCOMPATIBLE_LOCATIONS, PIPELINE_VERSION, POSSIBLE_DUPLICATE,
+    SHARED_PLACEHOLDER_COORDINATE, UNRESOLVED_LOCATION, description_subject_conflict, finding,
+)
 from .explanations import explain, warnings_for
 from .geography import EARTH_RADIUS_KM, PlaceIndex, ResolvedLocation, aggregate_pin, haversine_km
 from .normalization import (
     clean_str, is_valid_uuid, normalize_district, normalize_name, normalize_pin, normalize_state,
     parse_array, parse_nfhs_value, validate_coordinates,
 )
-from .scoring import location_quality_score, rank_key, score_candidate
+from .scoring import (
+    COMPONENTS, eligibility, evidence_category, evidence_strength_score, location_quality_score, rank_key,
+    score_candidate,
+)
 from .service_matching import TAXONOMY, exact_term_hit, keyword_hit, match_service, parse_record
 
 ORIGINAL_FACILITY_COLUMNS_REQUIRED = [
@@ -208,7 +217,8 @@ def build_facility_silver(raw: pd.DataFrame, pin_silver: pd.DataFrame):
 
     # 5. Join PIN reference (PIN grain -> no fanout possible; checked anyway).
     pin_ref = pin_silver[["pincode", "centroid_lat", "centroid_lon", "coords_defensible", "states_json",
-                          "primary_district", "is_ambiguous"]].rename(columns={
+                          "primary_district", "is_ambiguous", "n_states", "n_districts"]].rename(columns={
+        "n_states": "pin_n_states", "n_districts": "pin_n_districts",
         "pincode": "pin_ref_pincode", "centroid_lat": "pin_centroid_lat", "centroid_lon": "pin_centroid_lon",
         "coords_defensible": "pin_coords_defensible", "states_json": "pin_states_json",
         "primary_district": "pin_primary_district", "is_ambiguous": "pin_is_ambiguous"})
@@ -284,11 +294,93 @@ def build_facility_silver(raw: pd.DataFrame, pin_silver: pd.DataFrame):
     df["facility_flags_json"] = flags
     df["primary_source_url"] = [_primary_url(w, s) for w, s in zip(df["officialWebsite"] if "officialWebsite" in df else [None] * len(df),
                                                                  df["source_urls_list_json"])]
+    # 9. Identity / location credibility findings (reason codes + severity) and confidence scores.
+    pin_xy = {r.pincode: (r.centroid_lat, r.centroid_lon) for r in pin_silver.itertuples()
+              if bool(r.coords_defensible) and r.centroid_lat is not None and not pd.isna(r.centroid_lat)}
+    coord_names = df[df["facility_lat"].notna()].groupby(["facility_lat", "facility_lon"])["facility_name_norm"].nunique().to_dict()
+    findings_col, idc, locc = [], [], []
+    for r in df.itertuples(index=False):
+        fnd = facility_findings(r, pin_xy, coord_names)
+        findings_col.append(_dumps(fnd))
+        idc.append(identity_confidence(fnd))
+        locc.append(location_confidence(r.location_quality_score, fnd))
+    df["facility_findings_json"] = findings_col
+    df["identity_confidence_score"] = idc
+    df["location_confidence_score"] = locc
+    df["pipeline_version"] = PIPELINE_VERSION
     reports["silver_rows"] = len(df)
     reports["location_source_counts"] = df["location_source"].value_counts().to_dict()
     print(f"[facilities] input={reports['input_rows']} quarantined={reports['quarantined_rows']} "
           f"exact_dups_removed={reports['exact_duplicate_rows_removed']} silver={len(df)}")
     return df.reset_index(drop=True), quarantine.reset_index(drop=True), reports
+
+
+_TEXT_PIN = re.compile(r"(?<!\d)([1-9]\d{2})\s?(\d{3})(?!\d)")
+IDENTITY_CODES = {MULTIPLE_FACILITY_IDENTITIES, POSSIBLE_DUPLICATE, MISSING_SOURCE_PROVENANCE, "SUSPICIOUS_SOURCE_URL"}
+_SEV_COST = {HIGH: 0.6, MEDIUM: 0.25, LOW: 0.05}
+
+
+def facility_findings(r, pin_xy: dict, coord_names) -> list:
+    """Facility-level identity/location findings for one silver row (namedtuple)."""
+    out = []
+    place = tuple(t for v in (r.address_city, r.address_stateOrRegion) for t in (normalize_name(v) or "").split())
+    subj = description_subject_conflict(clean_str(r.description), r.name, place)
+    if subj:
+        out.append(finding(MULTIPLE_FACILITY_IDENTITIES, HIGH,
+                           f"description is about '{subj}', not '{r.name}': \"{(clean_str(r.description) or '')[:160]}\""))
+    d = r.facility_to_pin_km
+    if d is not None and not pd.isna(d) and d > LOCATION_CONFLICT_KM:
+        out.append(finding(COORDINATE_LOCATION_CONFLICT, HIGH if d > 100 else MEDIUM,
+                           f"coordinates are {d:.0f} km from the centroid of the listed PIN {r.pincode_norm}"))
+    if r.state_conflict:
+        out.append(finding(MULTIPLE_INCOMPATIBLE_LOCATIONS, HIGH,
+                           f"listed state '{r.address_stateOrRegion}' is not a state of PIN {r.pincode_norm} {r.pin_states_json}"))
+    if r.location_source == "none":
+        out.append(finding(UNRESOLVED_LOCATION, HIGH, "no valid coordinates and no reliable PIN centroid"))
+    elif r.location_source == "pin_centroid":
+        out.append(finding(UNRESOLVED_LOCATION, MEDIUM, "no valid coordinates; position approximated by PIN centroid"))
+    if r.location_lat is not None and not pd.isna(r.location_lat):
+        text = " ".join([clean_str(r.description) or ""] + parse_array(r.capability))
+        far = []
+        for a, b in _TEXT_PIN.findall(text):
+            pin = a + b
+            if pin != r.pincode_norm and pin in pin_xy:
+                km = haversine_km(r.location_lat, r.location_lon, *pin_xy[pin])
+                if km > 50:
+                    far.append(f"{pin} ({km:.0f} km away)")
+        if far:
+            out.append(finding(MULTIPLE_INCOMPATIBLE_LOCATIONS, MEDIUM, "text mentions distant PIN(s): " + ", ".join(far[:3])))
+    if r.facility_lat is not None and not pd.isna(r.facility_lat):
+        n = coord_names.get((r.facility_lat, r.facility_lon), 1)
+        if n >= 3:
+            out.append(finding(SHARED_PLACEHOLDER_COORDINATE, MEDIUM,
+                               f"{n} differently named facilities share exactly these coordinates"))
+    if getattr(r, "pin_n_states", 0) and not pd.isna(r.pin_n_states) and r.pin_n_states > 1:
+        out.append(finding(AMBIGUOUS_PIN, MEDIUM, f"PIN {r.pincode_norm} spans {int(r.pin_n_states)} states"))
+    elif getattr(r, "pin_n_districts", 0) and not pd.isna(r.pin_n_districts) and r.pin_n_districts > 1:
+        out.append(finding(AMBIGUOUS_PIN, LOW, f"PIN {r.pincode_norm} spans {int(r.pin_n_districts)} districts"))
+    if r.possible_duplicate:
+        out.append(finding(POSSIBLE_DUPLICATE, LOW, "another record with the same normalized name lies within 1 km"))
+    if not json.loads(r.source_urls_list_json) and not clean_str(getattr(r, "officialWebsite", None)):
+        out.append(finding(MISSING_SOURCE_PROVENANCE, MEDIUM, "no source URL and no official website"))
+    if any(p in u.lower() for u in json.loads(r.source_urls_list_json) for p in SUSPICIOUS_URL_PATTERNS):
+        out.append(finding("SUSPICIOUS_SOURCE_URL", LOW, "source URLs include login/payment pages"))
+    return out
+
+
+def identity_confidence(findings: list) -> float:
+    cost = sum(_SEV_COST[f["severity"]] for f in findings if f["code"] in IDENTITY_CODES)
+    return round(max(0.0, 1.0 - cost), 4)
+
+
+def location_confidence(location_quality: float, findings: list) -> float:
+    cost = sum(_SEV_COST[f["severity"]] * 0.5 for f in findings
+               if f["code"] in (SHARED_PLACEHOLDER_COORDINATE, AMBIGUOUS_PIN, MULTIPLE_INCOMPATIBLE_LOCATIONS)
+               and f["severity"] != HIGH)
+    if any(f["severity"] == HIGH and f["code"] in (COORDINATE_LOCATION_CONFLICT, MULTIPLE_INCOMPATIBLE_LOCATIONS,
+                                                   UNRESOLVED_LOCATION) for f in findings):
+        return round(min(location_quality, 0.2), 4)
+    return round(max(0.0, location_quality - cost), 4)
 
 
 def _primary_url(official, urls_json) -> Optional[str]:
@@ -306,16 +398,20 @@ def _primary_url(official, urls_json) -> Optional[str]:
 # ---------------------------------------------------------------------------
 GOLD_CARRY = ["facility_id", "source_row_id", "name", "facilityTypeId", "address_line1", "address_city",
               "address_stateOrRegion", "address_zipOrPostcode", "location_lat", "location_lon", "location_source",
-              "location_quality_score", "facility_to_pin_km", "primary_source_url", "source_urls_list_json",
-              "facility_flags_json"]
+              "location_quality_score", "location_confidence_score", "identity_confidence_score", "facility_to_pin_km",
+              "primary_source_url", "source_urls_list_json", "facility_flags_json", "facility_findings_json"]
 
 
-def build_facility_service_gold(silver: pd.DataFrame, services=None) -> pd.DataFrame:
+def build_facility_service_gold(silver: pd.DataFrame, services=None, gates=None) -> pd.DataFrame:
+    """One row per (facility, service) with any signal: evidence, category, gate results, findings."""
+    from .config import GATES
+    gates = gates or GATES
     services = services or list(TAXONOMY)
     recs = []
     for r in silver.to_dict("records"):
         base = {k: r.get(k) for k in GOLD_CARRY}
         fflags = json.loads(r["facility_flags_json"])
+        ffind = json.loads(r["facility_findings_json"])
         parsed = parse_record(r)  # parse JSON text fields once, reuse for all services
         for s in services:
             m = match_service(parsed, s)
@@ -323,25 +419,60 @@ def build_facility_service_gold(silver: pd.DataFrame, services=None) -> pd.DataF
             ex = exact_term_hit(parsed, s)
             if m.evidence_level == "none" and not kw and not ex:
                 continue
-            all_flags = sorted(set(fflags) | set(m.conflicts))
+            category, claim_find = evidence_category(m, ffind)
+            failed = eligibility(category, m.primary_excerpt, float(r["identity_confidence_score"]),
+                                 float(r["location_confidence_score"]), ffind, claim_find,
+                                 {"facility_id": r["facility_id"], "source_row_id": r["source_row_id"],
+                                  "evidence_field": m.primary_excerpt_field}, gates)
             recs.append({
                 **base, "service": s, "evidence_level": m.evidence_level, "is_candidate": m.is_candidate,
+                "evidence_category": category, "eligible": not failed, "failed_gates_json": _dumps(failed),
+                "claim_findings_json": _dumps(claim_find),
                 "baseline_keyword_hit": kw, "baseline_exact_term_hit": ex,
-                "service_match_score": m.service_match_score,
-                "evidence_confidence_score": m.evidence_confidence_score,
-                "readiness_score": m.readiness_score,
+                "service_relevance_score": m.service_match_score,
+                "corroboration_score": m.evidence_confidence_score,
+                "evidence_strength_score": evidence_strength_score(category, m.evidence_confidence_score),
+                "readiness_evidence_score": m.readiness_score,
+                "n_distinct_statements": m.n_distinct_statements,
+                "has_description_statement": m.has_description_statement,
                 "matched_fields_json": _dumps(m.matched_fields), "matched_terms_json": _dumps(m.matched_terms),
                 "evidence_excerpt": m.primary_excerpt, "evidence_field": m.primary_excerpt_field,
                 "excerpts_json": _dumps(m.excerpts), "specialty_tags_json": _dumps(m.specialty_tags),
                 "negated_excerpts_json": _dumps(m.negated_excerpts),
                 "missing_corroboration_json": _dumps(m.missing_corroboration),
-                "flags_json": _dumps(all_flags),
+                "flags_json": _dumps(sorted(set(fflags) | set(m.conflicts))),
+                "pipeline_version": PIPELINE_VERSION,
             })
     gold = pd.DataFrame(recs)
     assert not gold.duplicated(["facility_id", "service"]).any(), "gold must be unique per (facility_id, service)"
-    bad = gold[gold["is_candidate"] & gold["evidence_excerpt"].isna()]
-    assert bad.empty, f"{len(bad)} candidate rows lack an evidence excerpt"
+    bad = gold[gold["eligible"] & gold["evidence_excerpt"].isna()]
+    assert bad.empty, f"{len(bad)} eligible rows lack an evidence excerpt"
     return gold
+
+
+def build_quarantine(silver: pd.DataFrame, gold: pd.DataFrame, rejected_rows: pd.DataFrame) -> pd.DataFrame:
+    """careproof_facilities_quarantine: one row per (record, [service], reason code)."""
+    rows = []
+    for r in rejected_rows.itertuples():
+        rows.append({"source_row_id": r.source_row_id, "facility_id": None, "facility_name": None, "service": None,
+                     "reason_code": "CORRUPTED_SOURCE_ROW", "severity": "high",
+                     "evidence": f"{r.quarantine_reason}: {str(r.unique_id)[:200]}", "human_review_required": True})
+    for r in silver.itertuples():
+        for f in json.loads(r.facility_findings_json):
+            if f["severity"] in ("high", "medium"):
+                rows.append({"source_row_id": r.source_row_id, "facility_id": r.facility_id, "facility_name": r.name,
+                             "service": None, "reason_code": f["code"], "severity": f["severity"],
+                             "evidence": f["evidence"], "human_review_required": f["human_review_required"]})
+    claims = gold[gold["is_candidate"] | gold["evidence_level"].isin(["negated_only", "other_facility_only"])]
+    for r in claims.itertuples():
+        for f in json.loads(r.claim_findings_json):
+            if f["severity"] in ("high", "medium"):
+                rows.append({"source_row_id": r.source_row_id, "facility_id": r.facility_id, "facility_name": r.name,
+                             "service": r.service, "reason_code": f["code"], "severity": f["severity"],
+                             "evidence": f["evidence"], "human_review_required": f["human_review_required"]})
+    q = pd.DataFrame(rows)
+    q["pipeline_version"] = PIPELINE_VERSION
+    return q
 
 
 # ---------------------------------------------------------------------------
@@ -354,56 +485,99 @@ def _haversine_vec(lat, lon, lats, lons):
     return 2 * EARTH_RADIUS_KM * np.arcsin(np.minimum(1.0, np.sqrt(a)))
 
 
+ANSWERED = "answered"
+ABSTAIN_NO_ELIGIBLE = "abstain_no_eligible_candidate"
+ABSTAIN_NO_MENTIONS = "abstain_no_mentions_in_radius"
+ABSTENTION_MESSAGE = ("We found records mentioning this service, but none had sufficiently consistent identity, "
+                      "location, and supporting evidence for a reliable recommendation.")
+NO_MENTION_MESSAGE = ("No facility record within this radius mentions this service. Absence from this dataset does "
+                      "not mean the service is unavailable; try a larger radius or contact the district health office.")
+
+
+def _loads(x):
+    return json.loads(x) if isinstance(x, str) else (x or [])
+
+
 def recommend(gold: pd.DataFrame, loc: ResolvedLocation, service_key: str, max_distance_km: float, top_k: int,
               weights: ScoringWeights = DEFAULT_WEIGHTS):
+    """Retrieve -> (precomputed) assess -> hard gate -> rank eligible only -> alternatives / abstention."""
     sdef = TAXONOMY[service_key]
     g = gold[(gold["service"] == service_key) & gold["location_lat"].notna()].copy()
     g["distance_km"] = _haversine_vec(loc.lat, loc.lon, g["location_lat"].values, g["location_lon"].values)
     near = g[g["distance_km"] <= max_distance_km]
-    cands = near[near["is_candidate"]]
+    mentions = near[near["evidence_level"] != "none"]          # retrieval stage (broad)
+    elig = mentions[mentions["eligible"].astype(bool)]           # gate stage
+    held = mentions[~mentions["eligible"].astype(bool)]
     summary = {
         "service": service_key, "service_label": sdef.label, "location": loc.label, "location_method": loc.method,
         "location_warnings": loc.warnings, "max_distance_km": max_distance_km,
-        "explicit_text_candidates_in_radius": int(len(cands)),
-        "specialty_tag_only_excluded": int((near["evidence_level"] == "specialty_tag_only").sum()),
-        "negated_only_excluded": int((near["evidence_level"] == "negated_only").sum()),
-        "facilities_without_usable_location": int(((gold["service"] == service_key) & gold["location_lat"].isna()
-                                                    & gold["is_candidate"]).sum()),
+        "retrieved_mentions_in_radius": int(len(mentions)),
+        "eligible_in_radius": int(len(elig)),
+        "held_back_in_radius": int(len(held)),
+        "held_back_by_category": held["evidence_category"].value_counts().to_dict(),
+        "pipeline_version": PIPELINE_VERSION,
     }
     results = []
-    for r in cands.to_dict("records"):
-        flags = json.loads(r["flags_json"])
-        sc = score_candidate({**r, "flags": flags}, r["distance_km"], weights)
-        missing, contra = warnings_for(flags, json.loads(r["missing_corroboration_json"]))
-        neg = json.loads(r["negated_excerpts_json"])
-        if neg:
-            contra.append(f'Contradicting text ({neg[0]["field"]}): "{neg[0]["text"][:160]}"')
-        results.append({
-            "facility_id": r["facility_id"], "facility_name": r["name"],
-            "address": ", ".join(x for x in [clean_str(r["address_line1"]), clean_str(r["address_city"]),
-                                             clean_str(r["address_stateOrRegion"]), clean_str(r["address_zipOrPostcode"])] if x),
-            "distance_km": round(float(r["distance_km"]), 2), "location_source": r["location_source"],
-            "location_lat": float(r["location_lat"]), "location_lon": float(r["location_lon"]),
-            "name_norm": normalize_name(r["name"]),
-            **sc,
-            "matched_fields": json.loads(r["matched_fields_json"]), "matched_terms": json.loads(r["matched_terms_json"]),
-            "specialty_tags": json.loads(r["specialty_tags_json"]),
-            "evidence_field": r["evidence_field"], "evidence_excerpt": r["evidence_excerpt"],
-            "all_excerpts": json.loads(r["excerpts_json"]),
-            "source_url": r["primary_source_url"],
-            "missing_data_warnings": missing, "contradiction_warnings": contra, "flags": flags,
-            "verification_warning": VERIFICATION_WARNING,
-        })
+    for r in elig.to_dict("records"):
+        ffind, cfind = _loads(r["facility_findings_json"]), _loads(r["claim_findings_json"])
+        sc = score_candidate({**r, "findings": ffind + cfind}, r["distance_km"], weights)
+        results.append(_result_row(r, sc, ffind, cfind))
     results.sort(key=rank_key)
     results = collapse_duplicates(results)
-    n_ranked = len(results)
+    alternatives_available = max(0, len(results) - top_k)
     results = results[:top_k]
-    summary["status"] = abstention_status(results, n_ranked)
     for i, r in enumerate(results, 1):
         r["rank"] = i
-        r["explanation"] = explain(r, sdef.label)
+    for i, r in enumerate(results):
+        r["explanation"] = explain(r, sdef.label, results[i + 1] if i + 1 < len(results) else None,
+                                   results[i - 1] if i > 0 else None)
+    summary["status"] = ANSWERED if results else (ABSTAIN_NO_ELIGIBLE if len(mentions) else ABSTAIN_NO_MENTIONS)
+    summary["message"] = None if results else (ABSTENTION_MESSAGE if len(mentions) else NO_MENTION_MESSAGE)
+    summary["additional_eligible_beyond_top_k"] = alternatives_available
+    summary["held_back"] = held_back_list(held)
     validate_recommendations(results)
     return results, summary
+
+
+def _result_row(r, sc, ffind, cfind) -> dict:
+    from .config import AVAILABILITY_NOT_VERIFIED, EVIDENCE_LABELS
+    idw = [f["evidence"] for f in ffind if f["code"] in IDENTITY_CODES]
+    locw = [f["evidence"] for f in ffind if f["code"] not in IDENTITY_CODES]
+    missing, contra = warnings_for(_loads(r["flags_json"]), _loads(r["missing_corroboration_json"]))
+    return {
+        "facility_id": r["facility_id"], "source_row_id": r["source_row_id"], "facility_name": r["name"],
+        "address": ", ".join(x for x in [clean_str(r["address_line1"]), clean_str(r["address_city"]),
+                                         clean_str(r["address_stateOrRegion"]), clean_str(r["address_zipOrPostcode"])] if x),
+        "distance_km": round(float(r["distance_km"]), 2), "location_source": r["location_source"],
+        "location_lat": float(r["location_lat"]), "location_lon": float(r["location_lon"]),
+        "name_norm": normalize_name(r["name"]),
+        "evidence_category": r["evidence_category"], "evidence_label": EVIDENCE_LABELS[r["evidence_category"]],
+        "availability_status": AVAILABILITY_NOT_VERIFIED,
+        **sc,
+        "matched_fields": _loads(r["matched_fields_json"]), "matched_terms": _loads(r["matched_terms_json"]),
+        "specialty_tags": _loads(r["specialty_tags_json"]),
+        "evidence_field": r["evidence_field"], "evidence_excerpt": r["evidence_excerpt"],
+        "all_excerpts": _loads(r["excerpts_json"]),
+        "source_url": r["primary_source_url"], "source_urls": _loads(r["source_urls_list_json"])[:5],
+        "identity_warnings": idw, "location_warnings": locw,
+        "missing_data_warnings": missing, "contradiction_warnings": contra,
+        "findings": ffind + cfind, "flags": _loads(r["flags_json"]),
+        "verification_warning": VERIFICATION_WARNING, "pipeline_version": r.get("pipeline_version", PIPELINE_VERSION),
+    }
+
+
+def held_back_list(held: pd.DataFrame, n: int = 10) -> list:
+    """Nearest records that mention the service but failed a gate (planner/audit view, never a recommendation)."""
+    out = []
+    for r in held.sort_values(["distance_km", "facility_id"]).head(n).to_dict("records"):
+        out.append({"facility_id": r["facility_id"], "facility_name": r["name"],
+                    "distance_km": round(float(r["distance_km"]), 2), "evidence_category": r["evidence_category"],
+                    "failed_gates": _loads(r["failed_gates_json"]),
+                    "reasons": [f"{f['code']} ({f['severity']}): {f['evidence']}" for f in
+                                _loads(r["facility_findings_json"]) + _loads(r["claim_findings_json"])
+                                if f["severity"] in ("high", "medium")][:3],
+                    "evidence_excerpt": r["evidence_excerpt"]})
+    return out
 
 
 def collapse_duplicates(ranked, radius_km: float = 1.0):
@@ -425,32 +599,19 @@ def collapse_duplicates(ranked, radius_km: float = 1.0):
     return kept
 
 
-ABSTAIN_NO_EVIDENCE = "abstain_no_explicit_evidence_in_radius"
-LOW_CONFIDENCE_ONLY = "answered_low_confidence_only"
-ANSWERED = "answered"
-
-
-def abstention_status(results, n_ranked) -> str:
-    """Explicit abstention semantics (see docs/system_card.md)."""
-    if not results:
-        return ABSTAIN_NO_EVIDENCE
-    if all(r["confidence"] == "Low" for r in results):
-        return LOW_CONFIDENCE_ONLY
-    return ANSWERED
-
-
 def validate_recommendations(results):
     for r in results:
         if not (r.get("evidence_excerpt") or "").strip():
             raise AssertionError(f"Recommendation {r['facility_id']} has no evidence excerpt")
-        if not r.get("evidence_field"):
-            raise AssertionError(f"Recommendation {r['facility_id']} has no evidence field (provenance)")
+        if not r.get("evidence_field") or not r.get("source_row_id"):
+            raise AssertionError(f"Recommendation {r['facility_id']} lacks provenance")
+        if r["evidence_category"] in ("conflicting", "insufficient"):
+            raise AssertionError(f"Recommendation {r['facility_id']} has {r['evidence_category']} evidence")
     ids = [r["facility_id"] for r in results]
     if len(ids) != len(set(ids)):
         raise AssertionError("Duplicate facility_id in recommendations")
     for r in results:
-        for k in ("service_match_score", "evidence_confidence_score", "location_quality_score", "distance_score",
-                  "readiness_score", "final_score", "data_quality_penalty"):
+        for k in COMPONENTS + ("final_ranking_score", "data_quality_penalty"):
             if not 0.0 <= r[k] <= 1.0:
                 raise AssertionError(f"{k}={r[k]} out of [0,1] for {r['facility_id']}")
 
@@ -485,3 +646,39 @@ def nearest_any_baseline(silver: pd.DataFrame, loc: ResolvedLocation, max_distan
     g = g[g["distance_km"] <= max_distance_km].sort_values(["distance_km", "facility_id"]).head(top_k)
     return [{"rank": i, "facility_id": r["facility_id"], "facility_name": r["name"],
              "distance_km": round(float(r["distance_km"]), 2)} for i, r in enumerate(g.to_dict("records"), 1)]
+
+
+# ---------------------------------------------------------------------------
+# Type coercion for tables read back from Spark/SQL (strings, Arrow types or Parquet) -> pipeline dtypes
+# ---------------------------------------------------------------------------
+GOLD_NUMERIC = ("location_lat", "location_lon", "location_quality_score", "location_confidence_score",
+                "identity_confidence_score", "service_relevance_score", "corroboration_score", "evidence_strength_score",
+                "readiness_evidence_score", "facility_to_pin_km", "n_distinct_statements")
+GOLD_BOOL = ("is_candidate", "eligible", "has_description_statement", "baseline_keyword_hit", "baseline_exact_term_hit")
+
+
+def _to_bool(s: pd.Series) -> pd.Series:
+    return s.map(lambda v: v if isinstance(v, (bool, np.bool_)) else str(v).strip().lower() == "true").astype(bool)
+
+
+def coerce_gold_types(g: pd.DataFrame) -> pd.DataFrame:
+    g = g.copy()
+    for c in GOLD_NUMERIC:
+        if c in g:
+            g[c] = pd.to_numeric(g[c], errors="coerce")
+    for c in GOLD_BOOL:
+        if c in g:
+            g[c] = _to_bool(g[c])
+    return g
+
+
+def coerce_pin_types(p: pd.DataFrame) -> pd.DataFrame:
+    p = p.copy()
+    for c in ("centroid_lat", "centroid_lon", "n_offices_with_valid_coords", "n_offices_coord_outliers",
+              "post_office_count", "n_districts", "n_states", "spread_km"):
+        if c in p:
+            p[c] = pd.to_numeric(p[c], errors="coerce")
+    for c in ("coords_defensible", "is_ambiguous", "missing_coordinates"):
+        if c in p:
+            p[c] = _to_bool(p[c])
+    return p

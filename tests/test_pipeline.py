@@ -65,7 +65,7 @@ def test_radius_only_filters_never_reorders(built):
     assert small_ids == large_within
     for a in small:
         b = next(x for x in large if x["facility_id"] == a["facility_id"])
-        assert a["final_score"] == b["final_score"]
+        assert a["final_ranking_score"] == b["final_ranking_score"]
 
 
 def test_excluded_levels_and_abstention(built):
@@ -73,9 +73,9 @@ def test_excluded_levels_and_abstention(built):
     res, summ = P.recommend(gold, LOC, "dialysis", 100, 10)
     names = {r["facility_name"] for r in res}
     assert "Negated Hospital" not in names and "Tag Only Hospital" not in names
-    assert summ["status"] in (P.ANSWERED, P.LOW_CONFIDENCE_ONLY)
+    assert summ["status"] == P.ANSWERED
     none, summ2 = P.recommend(gold, ResolvedLocation(20.0, 80.0, "far", "user_coordinates"), "dialysis", 10, 5)
-    assert none == [] and summ2["status"] == P.ABSTAIN_NO_EVIDENCE
+    assert none == [] and summ2["status"] == P.ABSTAIN_NO_MENTIONS and summ2["message"]
 
 
 def test_duplicates_collapsed(built):
@@ -106,3 +106,46 @@ def test_distinct_statements():
     assert count_distinct_statements(["Neonatal Intensive Care Unit (NICU)",
                                       "Neonatal Intensive Care Unit (NICU) with incubators"]) == 1
     assert count_distinct_statements([]) == 0
+
+
+def test_abstains_when_only_ineligible_mentions(built):
+    """Records mention the service nearby but none pass the gates -> explicit abstention, never a weak fallback."""
+    _, _, gold = built
+    g = gold.copy()
+    g["eligible"] = False
+    res, summ = P.recommend(g, LOC, "dialysis", 100, 5)
+    assert res == [] and summ["status"] == P.ABSTAIN_NO_ELIGIBLE
+    assert summ["message"] == P.ABSTENTION_MESSAGE and summ["held_back"]
+
+
+def test_distance_never_rescues_ineligible(built):
+    """The nearest record (Near Weak Clinic) is made ineligible; it must not appear however close it is."""
+    _, _, gold = built
+    g = gold.copy()
+    near_id = g[g["name"] == "Near Weak Clinic"]["facility_id"].iloc[0]
+    g.loc[g["facility_id"] == near_id, "eligible"] = False
+    res, summ = P.recommend(g, LOC, "dialysis", 100, 10)
+    assert near_id not in [r["facility_id"] for r in res]
+    assert near_id in [h["facility_id"] for h in summ["held_back"]]
+
+
+def test_alternatives_returned(built):
+    _, _, gold = built
+    res, summ = P.recommend(gold, LOC, "dialysis", 100, 2)
+    assert len(res) == 2 and summ["additional_eligible_beyond_top_k"] >= 1
+
+
+def test_quarantine_table(built):
+    silver, rejected, gold = built
+    q = P.build_quarantine(silver, gold, rejected)
+    assert {"source_row_id", "reason_code", "severity", "evidence", "human_review_required", "pipeline_version"} <= set(q.columns)
+    assert "CORRUPTED_SOURCE_ROW" in set(q.reason_code)
+    assert "SERVICE_CONTRADICTION" in set(q.reason_code)  # the "Dialysis not available" record
+
+
+def test_exact_quotation_preserved(built):
+    silver, _, gold = built
+    res, _ = P.recommend(gold, LOC, "dialysis", 100, 10)
+    for r in res:
+        src = silver.set_index("facility_id").loc[r["facility_id"]]
+        assert r["evidence_excerpt"] in (src[r["evidence_field"]] or "")

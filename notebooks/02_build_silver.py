@@ -3,7 +3,7 @@
 # MAGIC # 02 · Build silver tables
 # MAGIC Reads the read-only Marketplace tables (bronze) and writes three project-owned Delta tables:
 # MAGIC `careproof_pincode_silver` (PIN grain), `careproof_nfhs_silver` (long format), `careproof_facilities_silver`
-# MAGIC (+ `careproof_facilities_quarantine`, `careproof_join_report`). Idempotent: every write is a full overwrite
+# MAGIC (+ `careproof_facilities_rejected_rows`, `careproof_join_report`). Idempotent: every write is a full overwrite
 # MAGIC of a project-owned table. Set `rebuild_tables = yes` to rebuild tables that already exist.
 
 # COMMAND ----------
@@ -44,14 +44,14 @@ safe_write(pandas_to_spark(nfhs_silver), cfg, "nfhs_silver",
 # COMMAND ----------
 
 fac_raw = spark_to_pandas_str(spark.table(SOURCE_TABLES["facilities"].replace("`", "")))
-fac_silver, quarantine, rep = pipeline.build_facility_silver(fac_raw, pin_silver)
+fac_silver, rejected, rep = pipeline.build_facility_silver(fac_raw, pin_silver)
 print(json.dumps(rep, indent=1, default=str))
 safe_write(pandas_to_spark(fac_silver), cfg, "facilities_silver",
            "Facilities with original evidence fields preserved plus normalized location, PIN cross-checks and flags.")
-if len(quarantine):
-    safe_write(pandas_to_spark(quarantine), cfg, "facilities_quarantine", "Structurally corrupted source rows excluded from silver.")
+if len(rejected):
+    safe_write(pandas_to_spark(rejected), cfg, "facilities_rejected_rows", "Structurally corrupted source rows excluded from silver (original content preserved).")
 else:
-    print("No quarantined rows.")
+    print("No structurally corrupted rows.")
 
 # COMMAND ----------
 

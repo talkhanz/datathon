@@ -16,7 +16,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Mapping, Optional
 
-from .normalization import clean_str, parse_array
+from .credibility import attribution, third_party_language
+from .normalization import clean_str, normalize_name, parse_array
 
 # Field weights for service_match_score: how directly a field states a service.
 FIELD_STRENGTH = {
@@ -194,9 +195,12 @@ class Hit:
     field: str
     term: str          # the exact matched text
     excerpt: str       # exact substring of the original field value
-    negated: bool
+    negated: bool      # negated, planned, historical, referral or third-party provision
     has_detail: bool
     has_24x7: bool
+    attributable: bool = True          # False if the passage is about another named facility
+    other_orgs: tuple = ()
+    negation_kind: str = ""
 
 
 @dataclass
@@ -215,6 +219,8 @@ class ServiceMatch:
     negated_excerpts: list[dict] = field(default_factory=list)
     conflicts: list[str] = field(default_factory=list)
     missing_corroboration: list[str] = field(default_factory=list)
+    has_description_statement: bool = False
+    n_distinct_statements: int = 0
 
     @property
     def is_candidate(self) -> bool:
@@ -240,7 +246,7 @@ def _window(text: str, a: int, b: int, ms: int, me: int) -> str:
     return text[lo:hi].strip()
 
 
-def _scan(text: str, fld: str, rx: re.Pattern) -> list[Hit]:
+def _scan(text: str, fld: str, rx: re.Pattern, own_name: Optional[str] = None, ignore=()) -> list[Hit]:
     if not rx.search(text):  # fast path: most items never mention the service
         return []
     hits = []
@@ -248,9 +254,13 @@ def _scan(text: str, fld: str, rx: re.Pattern) -> list[Hit]:
         unit = text[a:b]
         for m in rx.finditer(unit):
             before, after = unit[: m.start()], unit[m.end():]
-            neg = bool(_NEG_BEFORE.search(before) or _NEG_AFTER.search(after) or _NOT_OPERATIONAL.search(unit))
+            kind = ("negated" if (_NEG_BEFORE.search(before) or _NEG_AFTER.search(after)) else
+                    "planned" if _NOT_OPERATIONAL.search(unit) else
+                    "third_party_or_historical" if third_party_language(unit) else "")
             ex = _window(text, a, b, a + m.start(), a + m.end())
-            hits.append(Hit(fld, m.group(0), ex, neg, bool(_DETAIL.search(unit)), bool(_24X7.search(unit))))
+            attr, others = attribution(unit, own_name, ignore) if own_name else (True, [])
+            hits.append(Hit(fld, m.group(0), ex, bool(kind), bool(_DETAIL.search(unit)), bool(_24X7.search(unit)),
+                            attr, tuple(others), kind))
     return hits
 
 
@@ -282,6 +292,7 @@ class ParsedRecord:
     facility_type: str
     any_24x7: bool
     keyword_blob: str
+    place_tokens: tuple = ()
 
 
 def parse_record(record: Mapping) -> ParsedRecord:
@@ -294,8 +305,10 @@ def parse_record(record: Mapping) -> ParsedRecord:
     blob = " ".join(
         [" ".join(parse_array(record.get(f), dedupe=False)) for f in (*ARRAY_FIELDS, "specialties")]
         + [strings[f] or "" for f in STRING_FIELDS]).lower()
+    place = tuple(t for f in ("address_city", "address_stateOrRegion")
+                  for t in (normalize_name(record.get(f)) or "").split())
     return ParsedRecord(arrays, strings, specialties, strings["name"],
-                        (clean_str(record.get("facilityTypeId")) or "").lower(), any24, blob)
+                        (clean_str(record.get("facilityTypeId")) or "").lower(), any24, blob, place)
 
 
 def match_service(record, service_key: str) -> ServiceMatch:
@@ -306,22 +319,25 @@ def match_service(record, service_key: str) -> ServiceMatch:
     hits: list[Hit] = []
     for f in ARRAY_FIELDS:
         for item in rec.arrays[f]:
-            hits.extend(_scan(item, f, strong_rx))
+            hits.extend(_scan(item, f, strong_rx, rec.name, rec.place_tokens))
     for f in STRING_FIELDS:
         s = rec.strings[f]
         if s:
-            hits.extend(_scan(s, f, strong_rx))
+            hits.extend(_scan(s, f, strong_rx, rec.name if f != "name" else None, rec.place_tokens))
     tags = [t for t in rec.specialties if tag_rx.search(t)]
     # Exclude eye-trauma style tags explicitly
     tags = [t for t in tags if not re.search(r"^eye|eyeTrauma|emergencyEye|dent", t, re.I)]
 
-    pos = [h for h in hits if not h.negated]
+    pos = [h for h in hits if not h.negated and h.attributable]
     neg = [h for h in hits if h.negated]
+    misattributed = [h for h in hits if not h.negated and not h.attributable]
     fields_pos = sorted({h.field for h in pos}, key=EXCERPT_FIELD_PRIORITY.index)
 
     conflicts, missing = [], []
     if neg:
         conflicts.append("negated_mention")
+    if misattributed:
+        conflicts.append("other_facility_attribution")
     profiles = [p for p in name_profiles(rec.name) if p not in sdef.profile_exempt]
     ftype = rec.facility_type
     if pos and (profiles or ftype in INCOMPATIBLE_FACILITY_TYPES):
@@ -355,6 +371,8 @@ def match_service(record, service_key: str) -> ServiceMatch:
         missing.append("no explicit text mention of the service")
     elif neg:
         level, smatch, conf, readiness = "negated_only", 0.0, 0.0, 0.0
+    elif misattributed:
+        level, smatch, conf, readiness = "other_facility_only", 0.0, 0.0, 0.0
     else:
         return ServiceMatch(service_key, "none", 0.0, 0.0, 0.0)
 
@@ -382,7 +400,11 @@ def match_service(record, service_key: str) -> ServiceMatch:
         primary_excerpt_field=primary.field if primary else None,
         excerpts=excerpts,
         specialty_tags=sorted(set(tags)),
-        negated_excerpts=[{"field": h.field, "text": h.excerpt} for h in neg[:3]],
+        negated_excerpts=[{"field": h.field, "text": h.excerpt, "kind": h.negation_kind} for h in neg[:3]]
+        + [{"field": h.field, "text": h.excerpt, "kind": "other_facility:" + "; ".join(h.other_orgs[:2])}
+           for h in misattributed[:3]],
+        has_description_statement=any(h.field == "description" for h in pos),
+        n_distinct_statements=count_distinct_statements([h.excerpt for h in pos]),
         conflicts=conflicts,
         missing_corroboration=missing,
     )

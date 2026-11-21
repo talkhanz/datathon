@@ -27,7 +27,10 @@ nfhs_5_district_health_indicators ─02─► careproof_nfhs_silver (long: distr
   * `geography.py` has Haversine distance, PIN aggregation, and location resolution with `LocationError`.
   * `service_matching.py` holds the taxonomy, exact-excerpt extraction, negation and planned detection,
     profile conflicts, and the baseline keyword hit.
-  * `scoring.py` computes the components, penalties, final score, confidence label, and deterministic `rank_key`.
+  * `credibility.py` holds the reason codes, organisation attribution, third-party/referral language, and description-subject conflicts.
+  * `scoring.py` handles evidence categories, hard eligibility gates, ranking components and the deterministic `rank_key`.
+  * `referral.py` provides the verification checklists, session statuses, next alternative and printable summary.
+  * `app/app.py` is the Streamlit Databricks App (Find · Compare · Verify · Refer).
   * `explanations.py` produces the warnings text, the plain-language explanation, and the HTML cards.
   * `pipeline.py` builds tables (pandas), `checked_left_join` (raises `FanoutError`), `recommend`, and the baseline.
   * `evaluation.py` runs the benchmark and computes the automatic metrics.
@@ -69,3 +72,9 @@ Defaults: service 0.30, evidence 0.25, location 0.10, distance 0.25, readiness 0
 * Tie-break: final score descending, then distance ascending, then `facility_id` ascending.
 * After ranking: same-name records within 1 km are collapsed and disclosed. The status is `answered`,
   `answered_low_confidence_only` or `abstain_no_explicit_evidence_in_radius`.
+
+
+> **Update (pipeline v0.2.0):** scoring is now *gate-then-rank*. See `evidence_policy.md` (categories and gates),
+> `quarantine_rules.md` (reason codes) and `confidence_semantics.md` (the seven separate concepts). The component
+> list above is superseded by: service_relevance, evidence_strength, identity_confidence, location_confidence,
+> readiness_evidence, distance, data_quality_penalty → final_ranking_score (eligible candidates only).

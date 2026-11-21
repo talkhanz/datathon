@@ -11,9 +11,9 @@ SELECT
   (SELECT COUNT(*) FROM databricks_virtue_foundation_dataset_dais_2026.virtue_foundation_dataset.facilities) AS bronze_rows,
   (SELECT COUNT(*) FROM careproof_facilities_silver)                                                         AS silver_rows,
   (SELECT COALESCE(SUM(n_exact_source_copies - 1), 0) FROM careproof_facilities_silver)                      AS exact_dups_removed,
-  (SELECT COUNT(*) FROM careproof_facilities_quarantine)                                                     AS quarantined_rows,
+  (SELECT COUNT(*) FROM careproof_facilities_rejected_rows)                                                  AS quarantined_rows,
   CASE WHEN bronze_rows = silver_rows + exact_dups_removed + quarantined_rows THEN 'PASS' ELSE 'FAIL' END   AS status;
--- NOTE: if careproof_facilities_quarantine does not exist (no corrupted rows on Databricks), replace that subquery with 0.
+-- NOTE: if careproof_facilities_rejected_rows does not exist (no corrupted rows on Databricks), replace that subquery with 0.
 
 -- 2. PIN silver is one row per PIN and reconciles to the post-office directory
 SELECT
@@ -42,14 +42,23 @@ SELECT pincode FROM careproof_pincode_silver WHERE NOT pincode RLIKE '^[1-9][0-9
 SELECT facility_id, pincode_norm FROM careproof_facilities_silver
 WHERE pincode_norm IS NOT NULL AND NOT pincode_norm RLIKE '^[1-9][0-9]{5}$';
 
--- 6. Null evidence: no recommendable gold row may lack an excerpt (expect zero rows)
+-- 6. Null evidence: no ELIGIBLE gold row may lack an excerpt or provenance (expect zero rows)
 SELECT facility_id, service FROM careproof_facility_service_gold
-WHERE is_candidate AND (evidence_excerpt IS NULL OR trim(evidence_excerpt) = '' OR evidence_field IS NULL);
+WHERE eligible AND (evidence_excerpt IS NULL OR trim(evidence_excerpt) = '' OR evidence_field IS NULL OR source_row_id IS NULL);
+
+-- 6b. Gate integrity: conflicting / insufficient evidence or high-severity findings must never be eligible (expect zero rows)
+SELECT facility_id, service, evidence_category FROM careproof_facility_service_gold
+WHERE eligible AND (evidence_category IN ('conflicting', 'insufficient')
+                    OR facility_findings_json LIKE '%"severity": "high"%' OR claim_findings_json LIKE '%"severity": "high"%');
+
+-- 6c. Quarantine table is well-formed (expect zero rows)
+SELECT * FROM careproof_facilities_quarantine
+WHERE reason_code IS NULL OR severity NOT IN ('high', 'medium') OR pipeline_version IS NULL;
 
 -- 7. Excerpt provenance: the excerpt must be an exact substring of the cited original field (expect zero rows)
 SELECT g.facility_id, g.service, g.evidence_field
 FROM careproof_facility_service_gold g JOIN careproof_facilities_silver s USING (facility_id)
-WHERE g.is_candidate AND NOT (
+WHERE g.eligible AND NOT (
   CASE g.evidence_field
     WHEN 'description' THEN instr(s.description, g.evidence_excerpt) > 0
     WHEN 'name'        THEN instr(s.name, g.evidence_excerpt) > 0
@@ -71,13 +80,17 @@ LEFT ANTI JOIN careproof_facilities_silver s USING (facility_id);
 
 -- 10. Score ranges (expect zero rows)
 SELECT facility_id, service FROM careproof_facility_service_gold
-WHERE NOT (service_match_score BETWEEN 0 AND 1 AND evidence_confidence_score BETWEEN 0 AND 1
-           AND readiness_score BETWEEN 0 AND 1 AND location_quality_score BETWEEN 0 AND 1);
+WHERE NOT (service_relevance_score BETWEEN 0 AND 1 AND evidence_strength_score BETWEEN 0 AND 1
+           AND readiness_evidence_score BETWEEN 0 AND 1 AND location_confidence_score BETWEEN 0 AND 1
+           AND identity_confidence_score BETWEEN 0 AND 1);
 
 -- 11. Recommendations missing citations or provenance (from the last evaluation run; expect zero rows)
 SELECT query_id, rank, facility_id FROM careproof_eval_results_detail
 WHERE evidence_excerpt IS NULL OR trim(evidence_excerpt) = '' OR evidence_field IS NULL
-   OR final_score NOT BETWEEN 0 AND 1 OR data_quality_penalty NOT BETWEEN 0 AND 1;
+   OR final_ranking_score NOT BETWEEN 0 AND 1 OR data_quality_penalty NOT BETWEEN 0 AND 1
+   OR evidence_category IN ('conflicting', 'insufficient');
 
 -- 12. Evidence-level overview (informational)
-SELECT service, evidence_level, COUNT(*) n FROM careproof_facility_service_gold GROUP BY ALL ORDER BY service, evidence_level;
+SELECT service, evidence_category, eligible, COUNT(*) n FROM careproof_facility_service_gold
+GROUP BY ALL ORDER BY service, evidence_category;
+SELECT reason_code, severity, COUNT(*) n FROM careproof_facilities_quarantine GROUP BY ALL ORDER BY n DESC;

@@ -45,13 +45,19 @@ def build():
           f"defensible={int(pin.coords_defensible.sum())} ({time.time()-t:.0f}s)")
     nfhs = P.build_nfhs_silver(read_csv("nfhs_5_district_health_indicators"))
     print(f"nfhs_silver rows={len(nfhs)} suppressed={int(nfhs.is_suppressed.sum())} small_sample={int(nfhs.is_small_sample.sum())}")
-    fac, quar, rep = P.build_facility_silver(read_csv("facilities"), pin)
+    fac, rejected, rep = P.build_facility_silver(read_csv("facilities"), pin)
     print(json.dumps({k: v for k, v in rep.items()}, default=str, indent=1))
     gold = P.build_facility_service_gold(fac)
+    quar = P.build_quarantine(fac, gold, rejected)
+    print("quarantine rows by reason/severity:\n", quar.groupby(["reason_code", "severity"]).size().to_string())
+    print("gold eligible by service x category:\n",
+          gold[gold.evidence_level != "none"].groupby(["service", "evidence_category"]).size().unstack(fill_value=0).to_string())
+    print("eligible per service:", gold[gold.eligible].groupby("service").size().to_dict())
     print(f"gold rows={len(gold)} ({time.time()-t:.0f}s)")
     print(gold.groupby(["service", "evidence_level"]).size().unstack(fill_value=0))
     for n, d in [("pincode_silver", pin), ("nfhs_silver", nfhs), ("facilities_silver", fac),
-                 ("facilities_quarantine", quar), ("facility_service_gold", gold)]:
+                 ("facilities_rejected_rows", rejected), ("facilities_quarantine", quar),
+                 ("facility_service_gold", gold)]:
         to_parquet(d, os.path.join(DER, f"careproof_{n}.parquet"))
 
 
@@ -72,11 +78,13 @@ def query(service, ltype, lvalue, max_km=100, top_k=5):
         print("LOCATION ERROR:", e); return
     gold = load("facility_service_gold")
     res, summ = P.recommend(gold, loc, sdef.key, float(max_km), int(top_k))
-    print(json.dumps(summ, indent=1))
+    print(json.dumps({k: v for k, v in summ.items() if k != "held_back"}, indent=1))
+    for h in summ["held_back"][:5]:
+        print("   HELD BACK:", h["facility_name"], h["distance_km"], "km", h["evidence_category"], h["failed_gates"], h["reasons"][:1])
     for r in res:
-        print(f"\n#{r['rank']} {r['facility_name']} | {r['distance_km']} km | final={r['final_score']} [{r['confidence']}]")
+        print(f"\n#{r['rank']} {r['facility_name']} | {r['distance_km']} km | rank_score={r['final_ranking_score']} [{r['evidence_label']}]")
         print("  ", r["explanation"])
-        for w in r["missing_data_warnings"] + r["contradiction_warnings"]:
+        for w in r["identity_warnings"] + r["location_warnings"] + r["missing_data_warnings"]:
             print("   !", w)
         print("   url:", r["source_url"])
     print("\nBASELINE nearest keyword match:")
@@ -102,7 +110,7 @@ def evaluate():
     # (1) curated smoke benchmark: behaviour on hand-picked edge cases (NOT an unbiased estimate)
     q = pd.read_csv(os.path.join(ROOT, "evaluation", "benchmark_queries.csv"), dtype=str, keep_default_na=False)
     qdf, rdf, ldf = run_benchmark(q, gold, silver, idx)
-    print(qdf[["query_id", "category", "service", "status", "n_results", "outcome_as_expected", "n_high", "n_low",
+    print(qdf[["query_id", "category", "service", "status", "n_results", "outcome_as_expected", "n_strong", "n_moderate", "n_weak", "held_back",
                "baseline_top1_weak", "message"]].to_string())
     print("CURATED BENCHMARK SUMMARY:", json.dumps(summarize(qdf), indent=1))
     # (2) frozen, seeded, stratified random sample (the unbiased set for label-free metrics + human labels)
@@ -124,6 +132,16 @@ def evaluate():
     lldf.sample(frac=1, random_state=1).to_csv(out, index=False)
     print("labeling template (shuffled, for blind review) ->", out, len(lldf), "rows")
     print("label metrics:", label_metrics(lldf).to_dict("records"))
+    from careproof.evaluation import make_pair_benchmark, pair_metrics, pair_review_sheet
+    pb_path = os.path.join(ROOT, "evaluation", "pair_benchmark_v1.csv")
+    if not os.path.exists(pb_path):
+        make_pair_benchmark(gold).to_csv(pb_path, index=False)
+        print("froze", pb_path)
+    pairs = pd.read_csv(pb_path, dtype=str, keep_default_na=False)
+    sheet = pair_review_sheet(pairs, gold, silver)
+    sheet.to_csv(os.path.join(ROOT, "evaluation", "pair_review_sheet_LOCAL.csv"), index=False)
+    print(f"pair benchmark: {len(pairs)} pairs; strata:", pairs.stratum.value_counts().to_dict())
+    print("pair metrics:", pair_metrics(sheet))
 
 
 if __name__ == "__main__" and sys.argv[1] == "eval":

@@ -29,6 +29,7 @@ DEFAULT_TARGET_SCHEMA = "careproof_india"
 TABLES = {
     "facilities_silver": "careproof_facilities_silver",
     "facilities_quarantine": "careproof_facilities_quarantine",
+    "facilities_rejected_rows": "careproof_facilities_rejected_rows",
     "pincode_silver": "careproof_pincode_silver",
     "nfhs_silver": "careproof_nfhs_silver",
     "facility_service_gold": "careproof_facility_service_gold",
@@ -83,12 +84,13 @@ DEFAULT_TOP_K = 5
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class ScoringWeights:
-    """Heuristic policy weights. They sum to 1.0 so the positive part is in [0, 1]."""
-    service_match: float = 0.30
-    evidence_confidence: float = 0.25
-    location_quality: float = 0.10
-    distance: float = 0.25
-    readiness: float = 0.10
+    """Ranking weights for ELIGIBLE candidates only. Policy choices, not learned. Normalised to sum to 1."""
+    service_relevance: float = 0.15
+    evidence_strength: float = 0.30
+    identity_confidence: float = 0.15
+    location_confidence: float = 0.10
+    readiness_evidence: float = 0.10
+    distance: float = 0.20
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -102,38 +104,49 @@ class ScoringWeights:
 
 DEFAULT_WEIGHTS = ScoringWeights()
 
-# Scenarios for sensitivity analysis (notebook 05). All are policy alternatives.
+# Sensitivity scenarios (notebook 05). All are policy alternatives.
 WEIGHT_SCENARIOS = {
     "default": ScoringWeights(),
-    "distance_first": ScoringWeights(0.20, 0.15, 0.10, 0.45, 0.10),
-    "evidence_first": ScoringWeights(0.30, 0.40, 0.10, 0.10, 0.10),
-    "equal": ScoringWeights(0.2, 0.2, 0.2, 0.2, 0.2),
-    "no_readiness": ScoringWeights(0.33, 0.28, 0.11, 0.28, 0.0),
+    "distance_first": ScoringWeights(0.10, 0.20, 0.10, 0.10, 0.05, 0.45),
+    "evidence_first": ScoringWeights(0.15, 0.45, 0.15, 0.10, 0.05, 0.10),
+    "equal": ScoringWeights(1, 1, 1, 1, 1, 1),
+    "no_readiness": ScoringWeights(0.15, 0.30, 0.15, 0.10, 0.0, 0.20),
 }
 
-# Subtractive penalties for data-quality / contradiction flags (policy choices).
+# ---------------------------------------------------------------------------
+# Evidence policy and hard eligibility gates (docs/evidence_policy.md). Configurable, tested.
+# ---------------------------------------------------------------------------
+EVIDENCE_CATEGORIES = ("insufficient", "conflicting", "weak", "moderate", "strong")
+EVIDENCE_LABELS = {
+    "strong": "Strong documented evidence",
+    "moderate": "Moderate documented evidence",
+    "weak": "Weak documented evidence",
+    "conflicting": "Conflicting evidence",
+    "insufficient": "Insufficient evidence",
+}
+# Base evidence_strength_score by category: separated so a nearby weaker claim cannot overtake a slightly
+# farther stronger one (tested: weak@0 km never beats moderate@10 km with otherwise equal components).
+EVIDENCE_STRENGTH_BASE = {"strong": 0.9, "moderate": 0.6, "weak": 0.25, "conflicting": 0.0, "insufficient": 0.0}
+GATES = {
+    "min_evidence_category": "weak",       # weak | moderate | strong  (conflicting/insufficient never pass)
+    "min_location_confidence": 0.6,        # rejects coordinate/PIN conflicts and PIN-centroid-only positions
+    "min_identity_confidence": 0.5,        # rejects records with a high-severity identity finding
+}
+
+# Low-severity issues that remain eligible but cost a little rank (policy).
 PENALTIES = {
-    "negated_mention": 0.20,          # text says the service is NOT offered / not available
-    "specialty_mismatch": 0.25,       # e.g. an eye or dental clinic claiming dialysis
-    "location_conflict": 0.15,        # coordinates disagree with the facility's own PIN by > LOCATION_CONFLICT_KM
-    "state_conflict": 0.10,           # stated state not among the states of the stated PIN
-    "suspicious_source_url": 0.05,    # source URLs include login / payment pages unrelated to health
-    "possible_duplicate": 0.03,       # same normalized name within 1 km of another record
-    "coordinates_from_pin": 0.05,     # no usable facility coordinates; PIN centroid used instead
+    "POSSIBLE_DUPLICATE": 0.03,
+    "SUSPICIOUS_SOURCE_URL": 0.05,
+    "AMBIGUOUS_PIN": 0.02,
 }
-MAX_TOTAL_PENALTY = 0.60
-
-# Confidence label thresholds (policy choices).
-CONFIDENCE_RULES = {
-    "high": {"min_service": 0.9, "min_evidence": 0.7, "max_penalty": 0.05, "min_location": 0.6},
-    "low": {"max_evidence": 0.5, "min_penalty": 0.25, "max_location": 0.4},
-}
+MAX_TOTAL_PENALTY = 0.30
 
 VERIFICATION_WARNING = (
-    "Availability, staffing, and hours are NOT verified. This listing is based on web-extracted "
-    "text that may be outdated or wrong. Call the facility to confirm the service is available "
-    "before travelling. In an emergency, call 108 (ambulance) or 112."
+    "CareProof is a referral planning and facility-discovery tool. Public facility information may be incomplete "
+    "or outdated. Contact the receiving facility to confirm service and admission availability before travel. "
+    "CareProof does not provide medical advice or emergency dispatch."
 )
+AVAILABILITY_NOT_VERIFIED = "Current availability not verified"
 DISTANCE_LABEL = "approximate straight-line distance (not road distance or travel time)"
 
 

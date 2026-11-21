@@ -18,7 +18,7 @@ Q16,ambiguous_pin,dialysis,pincode,110003,,,25,5,results_with_warning,PIN spans 
 Q17,missing_coords,dialysis,pincode,176057,,,50,5,location_error,PIN with no coordinates in India Post directory
 Q18,ambiguous_place,dialysis,district,Aurangabad,,,50,5,location_error,district name exists in Bihar and Maharashtra
 Q19,invalid_input,mri,pincode,12345,,,25,5,location_error,five-digit PIN
-Q20,contradictory_record,dialysis,coordinates,,11.938235,79.485443,5,5,results,location of a merged 'Aravind Eye Hospital' record that claims a dialysis unit
+Q20,contradictory_record,dialysis,coordinates,,11.938235,79.485443,5,5,abstain,merged 'Aravind Eye Hospital' record + misattributed 'Abs Hospital' claim; expectation changed 2026-11-21 to abstain when merged/conflicting records became ineligible by policy
 Q21,inconsistent_pin_coords,dialysis,pincode,500001,,,25,5,location_error,PIN whose offices disagree on location (inconsistent coordinates)
 Q22,swapped_coords,nicu,coordinates,,77.2090,28.6139,25,5,location_error,lat/lon swapped by user
 Q23,duplicate_records,trauma,coordinates,,30.3340,76.4000,25,5,results,Patiala city centre; two near-identical Rajindra Hospital Patiala records; both must carry possible_duplicate flag

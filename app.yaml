@@ -1,0 +1,10 @@
+# Databricks App: CareProof Referral Navigator (Streamlit).
+# Deploy with the app's source code path = this repository folder (so src/careproof is included).
+command: ["streamlit", "run", "app/app.py", "--server.headless", "true"]
+env:
+  - name: CAREPROOF_CATALOG
+    value: "workspace"
+  - name: CAREPROOF_SCHEMA
+    value: "careproof_india"
+  - name: DATABRICKS_WAREHOUSE_ID
+    valueFrom: "sql-warehouse"   # add a SQL warehouse resource with this key when creating the app
