@@ -17,7 +17,7 @@ def search(svc="dialysis", loc="800001", radius=25):
     at.selectbox(key="svc").set_value(svc)
     at.text_input(key="loc_text").set_value(loc)
     at.selectbox(key="radius").set_value(radius)
-    at.button(key="go").click().run()
+    next(b for b in at.button if b.label == "Search").click().run()
     return at
 
 

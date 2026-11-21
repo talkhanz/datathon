@@ -109,7 +109,7 @@ with st.form("search", border=False):
                              placeholder="PIN (800001) · district (Patna, Bihar) · lat, lon")
     radius = c3.selectbox("Within", [10, 25, 50, 100, 200], index=2, format_func=lambda x: f"{x} km", key="radius")
     c4.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
-    go = c4.form_submit_button("Search", type="primary", use_container_width=True, key="go")
+    go = c4.form_submit_button("Search", type="primary", use_container_width=True)
 if go:
     run_search(svc, loc_text, radius, 5)
 
@@ -185,7 +185,7 @@ with right:
     pts = [{"lat": q["lat"], "lon": q["lon"], "color": "#d1242f", "size": 220}] + \
           [{"lat": r["location_lat"], "lon": r["location_lon"], "color": colors[r["evidence_category"]], "size": 140}
            for r in res]
-    st.map(pd.DataFrame(pts), latitude="lat", longitude="lon", color="color", size="size", height=330)
+    st.map(pd.DataFrame(pts), latitude="lat", longitude="lon", color="color", size="size")
     st.caption("🔴 patient location · 🟢 strong · 🔵 moderate · 🟡 weak evidence")
 
     # -------------------------------------------------------------------------------------------- call & refer

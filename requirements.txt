@@ -3,7 +3,7 @@
 pandas>=2.0
 numpy>=1.24
 pyarrow>=14
-streamlit>=1.38
+streamlit==1.38.0   # pinned to the Databricks Apps runtime version; tests run against it
 databricks-sql-connector>=3.0
 databricks-sdk>=0.30
 pytest>=7.0
