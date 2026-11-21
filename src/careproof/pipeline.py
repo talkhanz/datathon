@@ -15,7 +15,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from .config import DEFAULT_WEIGHTS, LOCATION_CONFLICT_KM, ScoringWeights, VERIFICATION_WARNING
+from .config import DEFAULT_WEIGHTS, DISTANCE_HALF_SCORE_KM, LOCATION_CONFLICT_KM, ScoringWeights, VERIFICATION_WARNING
 from .credibility import (
     AMBIGUOUS_PIN, COORDINATE_LOCATION_CONFLICT, HIGH, LOW, MEDIUM, MISSING_SOURCE_PROVENANCE,
     MULTIPLE_FACILITY_IDENTITIES, MULTIPLE_INCOMPATIBLE_LOCATIONS, PIPELINE_VERSION, POSSIBLE_DUPLICATE,
@@ -400,7 +400,8 @@ def _primary_url(official, urls_json) -> Optional[str]:
 GOLD_CARRY = ["facility_id", "source_row_id", "name", "facilityTypeId", "address_line1", "address_city",
               "address_stateOrRegion", "address_zipOrPostcode", "location_lat", "location_lon", "location_source",
               "location_quality_score", "location_confidence_score", "identity_confidence_score", "facility_to_pin_km",
-              "primary_source_url", "source_urls_list_json", "facility_flags_json", "facility_findings_json"]
+              "primary_source_url", "source_urls_list_json", "facility_flags_json", "facility_findings_json",
+              "officialPhone"]
 
 
 def build_facility_service_gold(silver: pd.DataFrame, services=None, gates=None) -> pd.DataFrame:
@@ -410,7 +411,7 @@ def build_facility_service_gold(silver: pd.DataFrame, services=None, gates=None)
     services = services or list(TAXONOMY)
     recs = []
     for r in silver.to_dict("records"):
-        base = {k: r.get(k) for k in GOLD_CARRY}
+        base = {k: r.get(k) for k in GOLD_CARRY}  # officialPhone: public facility contact, for call-ahead
         fflags = json.loads(r["facility_flags_json"])
         ffind = json.loads(r["facility_findings_json"])
         parsed = parse_record(r)  # parse JSON text fields once, reuse for all services
@@ -560,6 +561,7 @@ def _result_row(r, sc, ffind, cfind) -> dict:
         "evidence_field": r["evidence_field"], "evidence_excerpt": r["evidence_excerpt"],
         "all_excerpts": _loads(r["excerpts_json"]),
         "source_url": r["primary_source_url"], "source_urls": _loads(r["source_urls_list_json"])[:5],
+        "phone": clean_str(r.get("officialPhone")),
         "identity_warnings": idw, "location_warnings": locw,
         "missing_data_warnings": missing, "contradiction_warnings": contra,
         "findings": ffind + cfind, "flags": _loads(r["flags_json"]),
@@ -702,3 +704,121 @@ def spark_column_values(s: pd.Series):
                                                     and not isinstance(v, (bool, np.bool_)) for v in nn)):
         return "double", [None if missing(v) else float(v) for v in s.tolist()]
     return "string", [None if missing(v) else str(v) for v in s.tolist()]
+
+
+# ---------------------------------------------------------------------------
+# Optimised inference: precomputed per-service index (output identical to `recommend`, tested)
+# ---------------------------------------------------------------------------
+class RecommendationIndex:
+    """Precompute everything that does not depend on the query; a query is then distances + one sort.
+
+    Reference implementation: `recommend`. `tests/test_inference.py` asserts identical results and summaries.
+    """
+
+    def __init__(self, gold: pd.DataFrame, weights: ScoringWeights = DEFAULT_WEIGHTS, _prebuilt=None):
+        from .scoring import _WEIGHT_KEY, clamp01, data_quality_penalty
+        self.weights = weights
+        w = weights.normalized().as_dict()
+        self._w_dist = w["distance"]
+        if _prebuilt is not None:  # re-weight without re-parsing (used by policy optimisation)
+            self._by_service = {}
+            for svc, ix in _prebuilt.items():
+                parts = [None if c == "distance_score" else w[_WEIGHT_KEY[c]] * ix["raw"][c] for c in COMPONENTS]
+                self._by_service[svc] = {**ix, "parts": parts}
+            return
+        self._by_service = {}
+        g = gold[gold["location_lat"].notna()]
+        for svc, d in g.groupby("service", sort=False):
+            d = d.reset_index(drop=True)
+            static = np.zeros(len(d))
+            # same accumulation order as scoring.final_ranking_score (COMPONENTS order), distance added at query time
+            parts = []
+            for c in COMPONENTS:
+                parts.append(None if c == "distance_score" else
+                             w[_WEIGHT_KEY[c]] * np.array([clamp01(v) for v in d[c]]) if c in d else None)
+            pen = np.array([data_quality_penalty(_loads(a) + _loads(b))
+                            for a, b in zip(d["facility_findings_json"], d["claim_findings_json"])])
+            self._by_service[svc] = {
+                "rows": d, "lat": d["location_lat"].to_numpy(float), "lon": d["location_lon"].to_numpy(float),
+                "eligible": d["eligible"].to_numpy(bool), "mention": (d["evidence_level"] != "none").to_numpy(bool),
+                "parts": parts, "penalty": pen, "fid": d["facility_id"].astype(str).to_numpy(),
+                "raw": {c: np.array([clamp01(v) for v in d[c]]) for c in COMPONENTS if c in d},
+                "name": np.array([normalize_name(n) or "" for n in d["name"]], dtype=object),
+            }
+
+    def reweighted(self, weights: ScoringWeights) -> "RecommendationIndex":
+        return RecommendationIndex(None, weights, _prebuilt=self._by_service)
+
+    def _scores(self, ix, dist):
+        dscore = np.round(1.0 / (1.0 + np.maximum(0.0, dist) / DISTANCE_HALF_SCORE_KM), 4)
+        pos = np.zeros(len(dist))
+        for c, p in zip(COMPONENTS, ix["parts"]):
+            pos = pos + (self._w_dist * dscore if c == "distance_score" else p)
+        return np.round(np.clip(pos - np.clip(ix["penalty"], 0, 1), 0, 1), 4), dscore
+
+    def recommend(self, loc: ResolvedLocation, service_key: str, max_distance_km: float, top_k: int):
+        sdef = TAXONOMY[service_key]
+        ix = self._by_service.get(service_key)
+        if ix is None:
+            return recommend(pd.DataFrame(columns=["service", "location_lat"]), loc, service_key, max_distance_km, top_k)
+        dist = _haversine_vec(loc.lat, loc.lon, ix["lat"], ix["lon"])
+        near = dist <= max_distance_km
+        mention = near & ix["mention"]
+        elig = mention & ix["eligible"]
+        held = mention & ~ix["eligible"]
+        e_idx = np.flatnonzero(elig)
+        final, _ = self._scores(ix, dist)
+        rows = ix["rows"]
+        # rank order = scoring.rank_key: (-round(score, 6), distance, facility_id)
+        order = e_idx[np.lexsort((ix["fid"][e_idx], dist[e_idx], -np.round(final[e_idx], 6)))] if len(e_idx) else e_idx
+        # light duplicate-collapse pass (same semantics as collapse_duplicates) on arrays only
+        kept, collapsed_into, by_name = [], {}, {}
+        for i in order:
+            nm = ix["name"][i]
+            twin = None
+            if nm:
+                for k in by_name.get(nm, []):
+                    if haversine_km(ix["lat"][k], ix["lon"][k], ix["lat"][i], ix["lon"][i]) <= 1.0:
+                        twin = k
+                        break
+            if twin is None:
+                kept.append(i)
+                by_name.setdefault(nm, []).append(i)
+            else:
+                collapsed_into.setdefault(twin, []).append(i)
+        results = []
+        for i in kept[:top_k]:  # build full result rows only for what is shown
+            r = rows.iloc[i].to_dict()
+            r["distance_km"] = float(dist[i])
+            ffind, cfind = _loads(r["facility_findings_json"]), _loads(r["claim_findings_json"])
+            sc = score_candidate({**r, "findings": ffind + cfind}, r["distance_km"], self.weights)
+            row = _result_row(r, sc, ffind, cfind)
+            row["duplicate_records_collapsed"] = []
+            for j in collapsed_into.get(i, []):
+                fid = ix["fid"][j]
+                row["duplicate_records_collapsed"].append(fid)
+                msg = (f"A near-identical record ({fid}) was merged into this result; the listing may be "
+                       "duplicated in the source data.")
+                if msg not in row["missing_data_warnings"]:
+                    row["missing_data_warnings"].append(msg)
+            results.append(row)
+        for n, r in enumerate(results, 1):
+            r["rank"] = n
+        for n, r in enumerate(results):
+            r["explanation"] = explain(r, sdef.label, results[n + 1] if n + 1 < len(results) else None,
+                                       results[n - 1] if n > 0 else None)
+        held_df = rows[held].assign(distance_km=dist[held])
+        summary = {
+            "service": service_key, "service_label": sdef.label, "location": loc.label, "location_method": loc.method,
+            "location_warnings": loc.warnings, "max_distance_km": max_distance_km,
+            "retrieved_mentions_in_radius": int(mention.sum()), "eligible_in_radius": int(elig.sum()),
+            "held_back_in_radius": int(held.sum()),
+            "held_back_by_category": held_df["evidence_category"].value_counts().to_dict(),
+            "pipeline_version": PIPELINE_VERSION,
+            "status": ANSWERED if results else (ABSTAIN_NO_ELIGIBLE if mention.any() else ABSTAIN_NO_MENTIONS),
+            "message": None if results else (ABSTENTION_MESSAGE if mention.any() else NO_MENTION_MESSAGE),
+            "additional_eligible_beyond_top_k": max(0, len(kept) - top_k),
+            "held_back": held_back_list(held_df),
+        }
+        validate_recommendations(results)
+        return results, summary

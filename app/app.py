@@ -1,8 +1,7 @@
-"""CareProof Referral Navigator: Databricks App (Streamlit).
+"""CareProof Referral Navigator: Databricks App (Streamlit). Search -> scan results -> call & refer.
 
-Find -> Compare -> Verify -> Refer. All ranking/evidence logic is the tested `careproof` package (same code as the
-notebooks). Data: project-owned tables via a SQL warehouse (Databricks), or local Parquet when
-CAREPROOF_LOCAL_DATA is set (development). No patient-identifiable information is collected or stored.
+All ranking/evidence logic is the tested `careproof` package (identical to the notebooks), served through the
+precomputed `RecommendationIndex`. No patient-identifiable information is collected or stored.
 """
 from __future__ import annotations
 
@@ -19,264 +18,226 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from careproof import config, pipeline as P  # noqa: E402
-from careproof.config import EVIDENCE_LABELS, TABLES, VERIFICATION_WARNING, fq_table, validate_identifier  # noqa: E402
-from careproof.explanations import COMPONENT_NAMES  # noqa: E402
-from careproof.geography import LocationError, resolve_location  # noqa: E402
-from careproof.referral import (BLOCKING_STATUSES, STATUSES, availability_label, checklist, next_alternative,  # noqa: E402
+from careproof.config import TABLES, VERIFICATION_WARNING, fq_table, validate_identifier  # noqa: E402
+from careproof.explanations import COMPONENT_NAMES, gate_reason_short, short_reasons  # noqa: E402
+from careproof.geography import LocationError, resolve_free_text  # noqa: E402
+from careproof.referral import (BLOCKING_STATUSES, STATUSES, checklist, next_alternative,  # noqa: E402
                                 referral_summary)
 from careproof.service_matching import TAXONOMY  # noqa: E402
 
 st.set_page_config(page_title="CareProof Referral Navigator", page_icon="🩺", layout="wide")
+st.markdown("<style>div.block-container{padding-top:1.4rem} blockquote{margin:.3rem 0}</style>", unsafe_allow_html=True)
 
-BADGE = {"strong": "🟢", "moderate": "🔵", "weak": "🟡", "conflicting": "🔴", "insufficient": "⚪"}
+BADGE = {"strong": "🟢 Strong evidence", "moderate": "🔵 Moderate evidence", "weak": "🟡 Weak evidence"}
+SERVICE_SHORT = {"dialysis": "Dialysis", "c_section": "C-section / emergency obstetric surgery", "nicu": "NICU (newborn ICU)",
+                 "mri": "MRI scan", "cardiac_surgery": "Cardiac surgery", "burn_care": "Burn care",
+                 "trauma_emergency": "Trauma & emergency"}
 _MD = re.compile(r"([\\`*_{}\[\]()#+\-.!|>~<])")
 
 
 def md(text) -> str:
-    """Escape untrusted source text before rendering it as Markdown."""
     return _MD.sub(r"\\\1", str(text or ""))
 
 
-# ------------------------------------------------------------------------------------------------ data loading
-@st.cache_resource(show_spinner="Loading facility evidence tables…")
+def clip(text, n=150) -> str:
+    t = " ".join(str(text or "").split())
+    return t if len(t) <= n else t[: n - 1].rstrip() + "…"
+
+
+# ------------------------------------------------------------------------------------------------ data
+@st.cache_resource(show_spinner="Loading facility evidence…")
 def load_data():
     local = os.environ.get("CAREPROOF_LOCAL_DATA")
     if local:
         gold = pd.read_parquet(os.path.join(local, "careproof_facility_service_gold.parquet"))
         pin = pd.read_parquet(os.path.join(local, "careproof_pincode_silver.parquet"))
-        source = f"local Parquet ({os.path.basename(local.rstrip('/'))})"
     else:
         from databricks import sql
         from databricks.sdk.core import Config
         cfg = Config()
         cat = validate_identifier(os.environ.get("CAREPROOF_CATALOG", config.DEFAULT_TARGET_CATALOG), "catalog")
         sch = validate_identifier(os.environ.get("CAREPROOF_SCHEMA", config.DEFAULT_TARGET_SCHEMA), "schema")
-        wh = os.environ["DATABRICKS_WAREHOUSE_ID"]
         with sql.connect(server_hostname=cfg.host.replace("https://", "").rstrip("/"),
-                         http_path=f"/sql/1.0/warehouses/{wh}",
+                         http_path=f"/sql/1.0/warehouses/{os.environ['DATABRICKS_WAREHOUSE_ID']}",
                          credentials_provider=lambda: cfg.authenticate) as conn, conn.cursor() as cur:
             cur.execute(f"SELECT * FROM {fq_table(cat, sch, TABLES['facility_service_gold'])}")
             gold = cur.fetchall_arrow().to_pandas()
             cur.execute(f"SELECT * FROM {fq_table(cat, sch, TABLES['pincode_silver'])}")
             pin = cur.fetchall_arrow().to_pandas()
-        source = f"{cat}.{sch} (SQL warehouse)"
     gold, pin = P.coerce_gold_types(gold), P.coerce_pin_types(pin)
-    return gold, P.place_index_from_pin_silver(pin), source
+    return gold, P.RecommendationIndex(gold), P.place_index_from_pin_silver(pin)
 
 
-def gold_lookup(gold, facility_id, service):
-    m = gold[(gold.facility_id == facility_id) & (gold.service == service)]
+def gold_row(gold, fid, svc):
+    m = gold[(gold.facility_id == fid) & (gold.service == svc)]
     return None if m.empty else m.iloc[0]
 
 
-# ------------------------------------------------------------------------------------------------ session state
 ss = st.session_state
-for k, v in {"results": None, "summary": None, "baseline": None, "query": None, "selected": None,
-             "statuses": {}, "checks": {}, "notes": ""}.items():
+for k, v in {"res": None, "summ": None, "base": None, "q": None, "sel": None, "status": {}, "checks": {},
+             "notes": "", "err": None, "k": 5}.items():
     ss.setdefault(k, v)
 
-# ------------------------------------------------------------------------------------------------ header
-st.title("🩺 CareProof Referral Navigator")
-st.caption("**The nearest claimed provider is not necessarily the nearest credibly supported provider.** "
-           "CareProof finds facilities whose own records document a service, shows the exact evidence and its "
-           "weaknesses, and helps you verify before referral.")
-st.warning(VERIFICATION_WARNING, icon="⚠️")
-
 try:
-    gold, index, data_source = load_data()
-except Exception as e:  # pragma: no cover - surfaced to the user
-    st.error(f"Could not load CareProof tables: {type(e).__name__}: {e}. Check that notebooks 02-03 have run and "
-             "that the app has SELECT access to the target schema and CAN USE on the SQL warehouse.")
+    gold, index, places = load_data()
+except Exception as e:  # pragma: no cover
+    st.error(f"Could not load CareProof data ({type(e).__name__}: {e}). Run notebooks 02–03 and check app permissions.")
     st.stop()
 
-# ------------------------------------------------------------------------------------------------ sidebar (inputs)
-with st.sidebar:
-    st.header("Search")
-    svc_keys = list(TAXONOMY)
-    svc = st.selectbox("Required service", svc_keys, format_func=lambda k: TAXONOMY[k].label, key="svc")
-    ltype = st.radio("Location type", ["pincode", "district", "city", "coordinates"], horizontal=True, key="ltype",
-                     format_func=lambda x: {"pincode": "PIN code", "district": "District", "city": "City",
-                                            "coordinates": "Coordinates"}[x])
-    lval, lat, lon = "", "", ""
-    if ltype == "coordinates":
-        c1, c2 = st.columns(2)
-        lat = c1.text_input("Latitude", "25.6093", key="lat")
-        lon = c2.text_input("Longitude", "85.1235", key="lon")
-    else:
-        hint = {"pincode": "800001", "district": "Patna, Bihar", "city": "Patna"}[ltype]
-        lval = st.text_input({"pincode": "6-digit PIN code", "district": "District (optionally ', State')",
-                              "city": "City (matched to a district)"}[ltype], hint, key="lval")
-    radius = st.slider("Search radius (km, straight-line)", 5, 300, 50, step=5, key="radius")
-    top_k = st.slider("Number of results", 1, 10, 5, key="topk")
-    go = st.button("Find facilities", type="primary", use_container_width=True, key="go")
-    st.caption(f"Data: {data_source} · pipeline "
-               f"{gold['pipeline_version'].iloc[0] if 'pipeline_version' in gold and len(gold) else ''}")
 
-if go:
+def run_search(svc, loc_text, radius, k):
     try:
-        loc = resolve_location(ltype, lval, lat, lon, index)
-        res, summ = P.recommend(gold, loc, svc, float(radius), int(top_k))
-        base = P.keyword_baseline(gold, loc, svc, float(radius), 5)
-        ss.update(results=res, summary=summ, baseline=base, selected=(res[0]["facility_id"] if res else None),
-                  query={"service": svc, "label": TAXONOMY[svc].label, "origin": loc.label, "radius": radius},
-                  statuses={}, checks={}, notes="", loc_error=None)
+        loc = resolve_free_text(loc_text, places)
     except LocationError as e:
-        ss.update(results=None, summary=None, baseline=None, selected=None, loc_error=str(e))
+        ss.update(res=None, err=str(e))
+        return
+    res, summ = index.recommend(loc, svc, float(radius), int(k))
+    ss.update(res=res, summ=summ, base=P.keyword_baseline(gold, loc, svc, float(radius), 1), err=None,
+              q={"svc": svc, "label": TAXONOMY[svc].label, "origin": loc.label, "radius": radius, "text": loc_text,
+                 "lat": loc.lat, "lon": loc.lon},
+              sel=None, status={}, checks={}, notes="", k=k)
 
-if ss.get("loc_error"):
-    st.error(f"**Location could not be resolved reliably.** {ss['loc_error']}")
 
-if ss.results is None:
-    st.info("Choose a service and a location in the sidebar, then click **Find facilities**.")
+# ------------------------------------------------------------------------------------------------ header + search
+st.markdown("## 🩺 CareProof Referral Navigator")
+st.caption("Finds facilities whose own records **credibly** document a service, not just the nearest name that mentions it.")
+
+with st.form("search", border=False):
+    c1, c2, c3, c4 = st.columns([2.2, 3, 1.2, 1])
+    svc = c1.selectbox("Service needed", list(TAXONOMY), format_func=SERVICE_SHORT.get, key="svc")
+    loc_text = c2.text_input("Where is the patient?", "800001", key="loc_text",
+                             placeholder="PIN (800001) · district (Patna, Bihar) · lat, lon")
+    radius = c3.selectbox("Within", [10, 25, 50, 100, 200], index=2, format_func=lambda x: f"{x} km", key="radius")
+    c4.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
+    go = c4.form_submit_button("Search", type="primary", use_container_width=True, key="go")
+if go:
+    run_search(svc, loc_text, radius, 5)
+
+w1, w2 = st.columns([6, 1])
+w1.caption("⚠️ Planning aid only. Call the facility to confirm the service and admission before travel. Emergency: **108 / 112**.")
+with w2.popover("ℹ️ About"):
+    st.write(VERIFICATION_WARNING)
+    st.caption("Evidence levels describe how well the facility's public record documents the service, not whether it "
+               "is available today. Distances are straight-line, not travel time.")
+
+if ss.err:
+    st.error(ss.err, icon="📍")
+if ss.res is None:
+    st.info("Pick a service, type a PIN code, district or coordinates, and press **Search**.")
     st.stop()
 
-results, summary, q = ss.results, ss.summary, ss.query
-find_t, compare_t, verify_t, refer_t = st.tabs(["1 · Find", "2 · Compare", "3 · Verify", "4 · Refer"])
+res, summ, q = ss.res, ss.summ, ss.q
+for w in summ.get("location_warnings") or []:
+    st.caption(f"📍 {w}")
 
-# ------------------------------------------------------------------------------------------------ FIND
-with find_t:
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Records mentioning the service", summary["retrieved_mentions_in_radius"])
-    c2.metric("Passed all credibility gates", summary["eligible_in_radius"])
-    c3.metric("Held back (not recommended)", summary["held_back_in_radius"])
-    for w in summary.get("location_warnings") or []:
-        st.warning(w, icon="📍")
-    if not results:
-        st.error(f"**CareProof abstains.** {summary['message']}", icon="🛑")
-    for r in results:
-        status = ss.statuses.get(r["facility_id"], "Not contacted")
+# ------------------------------------------------------------------------------------------------ results
+left, right = st.columns([3, 2], gap="large")
+with left:
+    st.markdown(f"**{SERVICE_SHORT[q['svc']]}** near **{md(q['origin'])}** · {summ['eligible_in_radius']} of "
+                f"{summ['retrieved_mentions_in_radius']} listings that mention it passed the credibility checks")
+    if ss.base:  # why the nearest keyword match is / isn't first
+        b = ss.base[0]
+        shown = next((r for r in res if r["facility_id"] == b["facility_id"]), None)
+        if shown is None:
+            g = gold_row(gold, b["facility_id"], q["svc"])
+            why = gate_reason_short(json.loads(g["failed_gates_json"]),
+                                    json.loads(g["facility_findings_json"]) + json.loads(g["claim_findings_json"])) \
+                if g is not None else "not in the evidence table"
+            st.info(f"The nearest listing that mentions this service, **{md(b['facility_name'])}** "
+                    f"({b['distance_km']:.1f} km), is not shown: {why}.", icon="🔎")
+        elif shown["rank"] > 1:
+            st.info(f"The nearest listing, **{md(b['facility_name'])}** ({b['distance_km']:.1f} km), ranks "
+                    f"#{shown['rank']}: the options above have stronger or more consistent evidence.", icon="🔎")
+    if not res:
+        st.error(summ["message"], icon="🛑")
+        if q["radius"] < 300 and st.button(f"Search within {min(q['radius'] * 2, 300)} km", key="widen"):
+            run_search(q["svc"], q["text"], min(q["radius"] * 2, 300), ss.k)
+            st.rerun()
+    for r in res:
+        stt = ss.status.get(r["facility_id"], "Not contacted")
+        status_txt = ("✅ " + stt if stt in ("Confirmed", "Partially confirmed")
+                      else "⛔ " + stt if stt in BLOCKING_STATUSES else "☎ Not verified")
         with st.container(border=True):
-            h1, h2 = st.columns([3, 1])
-            h1.markdown(f"### #{r['rank']} {md(r['facility_name'])}")
-            h1.caption(md(r["address"]))
-            h2.markdown(f"{BADGE[r['evidence_category']]} **{r['evidence_label']}**")
-            h2.markdown(f"📏 **{r['distance_km']:.1f} km** approx. straight-line")
-            h2.markdown(f"☎ {availability_label(status)}")
-            if status in BLOCKING_STATUSES:
-                st.error(f"Reported this session: **{status}**. See the next alternative in the Verify tab.")
-            st.markdown(f"> “{md(r['evidence_excerpt'])}”")
-            st.caption(f"Exact excerpt · field `{r['evidence_field']}` · matched terms: {md(', '.join(r['matched_terms'][:6]))}"
-                       f" · fields: {md(', '.join(r['matched_fields']))}")
-            st.write(r["explanation"])
-            for w in r["identity_warnings"]:
-                st.markdown(f"🆔 **Identity:** {md(w)}")
-            for w in r["location_warnings"]:
-                st.markdown(f"🗺️ **Location:** {md(w)}")
-            for w in r["missing_data_warnings"]:
-                st.markdown(f"❔ **Missing information:** {md(w)}")
-            if r.get("source_url"):
-                st.markdown(f"Source (record-level): [{md(r['source_url'][:80])}]({r['source_url']})")
-            with st.expander("Component scores (policy weights; not probabilities)"):
-                st.dataframe(pd.DataFrame([{"component": COMPONENT_NAMES.get(k, k), "score": r[k]} for k in
-                                           list(COMPONENT_NAMES) + ["data_quality_penalty", "final_ranking_score"]]),
-                             hide_index=True, use_container_width=True)
-                st.caption(f"facility_id {r['facility_id']} · source_row_id {r['source_row_id'][:12]}… · {r['pipeline_version']}")
-            if st.button("Select for verification", key=f"sel_{r['facility_id']}"):
-                ss.selected = r["facility_id"]
-                st.success("Selected. Open the **Verify** tab.")
-    if summary.get("held_back"):
-        with st.expander(f"Planner / audit view: {len(summary['held_back'])} nearest records held back"):
-            st.caption("These records mention the service but failed at least one credibility gate. They are shown for "
-                       "transparency and data review, **not** as referral options.")
-            st.dataframe(pd.DataFrame([{"facility": h["facility_name"], "km": h["distance_km"],
-                                        "evidence": EVIDENCE_LABELS[h["evidence_category"]],
-                                        "failed gates": "; ".join(h["failed_gates"]),
-                                        "why": " | ".join(h["reasons"]), "excerpt": h["evidence_excerpt"]}
-                                       for h in summary["held_back"]]), hide_index=True, use_container_width=True)
+            a, b = st.columns([4, 1.4])
+            a.markdown(f"**{r['rank']}. {md(r['facility_name'])}**  \n"
+                       f"{r['distance_km']:.1f} km · {md(clip(r['address'], 60))}")
+            b.markdown(f"{BADGE.get(r['evidence_category'], '')}  \n{status_txt}")
+            st.markdown(f"> “{md(clip(r['evidence_excerpt']))}”")
+            x, y, _ = st.columns([1.3, 1, 2])
+            if x.button("📞 Call & refer", key=f"pick_{r['facility_id']}", use_container_width=True):
+                ss.sel = r["facility_id"]
+            with y.popover("Why?", use_container_width=True):
+                sr = short_reasons(r)
+                st.markdown(f"✅ {md(sr['supported'])}")
+                for c in sr["caution"]:
+                    st.markdown(f"⚠️ {md(c)}")
+                st.markdown(f"❔ {sr['unknown']}")
+                st.caption(f"Full quote ({r['evidence_field']}): “{md(r['evidence_excerpt'])}”")
+                if r.get("source_url"):
+                    st.markdown(f"[Source]({r['source_url']})")
+    if res and summ["additional_eligible_beyond_top_k"] and ss.k < 10:
+        if st.button("Show more options", key="more"):
+            run_search(q["svc"], q["text"], q["radius"], 10)
+            st.rerun()
 
-# ------------------------------------------------------------------------------------------------ COMPARE
-with compare_t:
-    st.subheader("Nearest keyword match vs CareProof")
-    base = ss.baseline or []
-    left, right = st.columns(2)
-    with left:
-        st.markdown("**Nearest keyword match** (distance only; no evidence checks)")
-        if base:
-            b = base[0]
-            g = gold_lookup(gold, b["facility_id"], q["service"])
-            st.markdown(f"### {md(b['facility_name'])}\n📏 {b['distance_km']:.1f} km")
-            if g is not None:
-                st.markdown(f"Evidence: {BADGE[g['evidence_category']]} {EVIDENCE_LABELS[g['evidence_category']]}")
-                failed = json.loads(g["failed_gates_json"])
-                (st.error if failed else st.success)("Fails: " + "; ".join(failed) if failed else "Passes all gates")
-                if isinstance(g["evidence_excerpt"], str):
-                    st.markdown(f"> “{md(g['evidence_excerpt'])}”")
-        else:
-            st.info("No keyword match in this radius.")
-    with right:
-        st.markdown("**CareProof top eligible candidate**")
-        if results:
-            t = results[0]
-            nearest = min(results, key=lambda r: r["distance_km"])
-            st.markdown(f"### {md(t['facility_name'])}\n📏 {t['distance_km']:.1f} km")
-            st.markdown(f"Evidence: {BADGE[t['evidence_category']]} {t['evidence_label']}")
-            st.markdown(f"> “{md(t['evidence_excerpt'])}”")
-            if nearest["facility_id"] != t["facility_id"]:
-                st.caption(f"Nearest eligible candidate: {md(nearest['facility_name'])} ({nearest['distance_km']:.1f} km), "
-                           f"ranked #{nearest['rank']} because its documented evidence or consistency is weaker.")
-        else:
-            st.error("No eligible candidate: CareProof abstains.")
-    st.markdown("#### Why they differ")
-    if base and results and base[0]["facility_id"] == results[0]["facility_id"]:
-        st.success("Both methods agree on the top facility, and it passes every credibility gate.")
-    elif base:
-        g = gold_lookup(gold, base[0]["facility_id"], q["service"])
-        reasons = json.loads(g["failed_gates_json"]) if g is not None else ["not in evidence table"]
-        st.write("The nearest keyword match is ranked by distance alone. "
-                 + (f"It is held back because: {', '.join(reasons)}." if reasons else
-                    "It passes the gates but ranks lower on evidence strength, identity or location consistency."))
-    st.dataframe(pd.DataFrame([{"keyword rank": b["rank"], "facility": b["facility_name"], "km": b["distance_km"],
-                                "CareProof": next((f"#{r['rank']} · {r['evidence_label']}" for r in results
-                                                   if r["facility_id"] == b["facility_id"]), "not recommended")}
-                               for b in base]), hide_index=True, use_container_width=True)
+with right:
+    colors = {"strong": "#1a7f37", "moderate": "#0969da", "weak": "#bf8700"}
+    pts = [{"lat": q["lat"], "lon": q["lon"], "color": "#d1242f", "size": 220}] + \
+          [{"lat": r["location_lat"], "lon": r["location_lon"], "color": colors[r["evidence_category"]], "size": 140}
+           for r in res]
+    st.map(pd.DataFrame(pts), latitude="lat", longitude="lon", color="color", size="size", height=330)
+    st.caption("🔴 patient location · 🟢 strong · 🔵 moderate · 🟡 weak evidence")
 
-# ------------------------------------------------------------------------------------------------ VERIFY
-with verify_t:
-    if not results:
-        st.error("Nothing to verify: no eligible candidate. Widen the radius or contact the district health office.")
-    else:
-        ids = [r["facility_id"] for r in results]
-        cur_idx = ids.index(ss.selected) if ss.selected in ids else 0
-        pick = st.selectbox("Facility being called", ids, index=cur_idx, key="verify_pick",
-                            format_func=lambda i: next(f"#{r['rank']} {r['facility_name']}" for r in results if r["facility_id"] == i))
-        ss.selected = pick
-        sel = next(r for r in results if r["facility_id"] == pick)
-        st.markdown(f"**{md(sel['facility_name'])}** · {sel['distance_km']:.1f} km · {sel['evidence_label']}")
-        st.caption("Statuses are kept for this session only. They do not change CareProof's facility records.")
-        status = st.selectbox("Call outcome", STATUSES, key=f"status_{pick}",
-                              index=STATUSES.index(ss.statuses.get(pick, "Not contacted")))
-        ss.statuses[pick] = status
-        st.markdown("**Call-ahead checklist**")
-        checks = ss.checks.setdefault(pick, {})
-        for i, item in enumerate(checklist(q["service"])):
-            checks[item] = st.checkbox(item, value=checks.get(item, False), key=f"chk_{pick}_{i}")
-        ss.notes = st.text_area("Coordinator notes (do NOT enter patient names, phone numbers or other identifiers)",
-                                ss.notes, key="notes_box", max_chars=500)
-        if status in BLOCKING_STATUSES:
-            alt = next_alternative(results, ss.statuses, exclude=pick)
-            if alt:
-                st.error(f"**{status}.** Next eligible alternative: **#{alt['rank']} {md(alt['facility_name'])}** "
-                         f"({alt['distance_km']:.1f} km, {alt['evidence_label']}).", icon="➡️")
-                if st.button(f"Switch to {alt['facility_name']}", key="switch_alt"):
-                    ss.selected = alt["facility_id"]
-                    st.rerun()
-            else:
-                st.error("No remaining eligible alternative in this radius. Widen the search or escalate to the "
-                         "district referral desk / 108.")
-        elif status == "Confirmed":
-            st.success("Confirmed by you this session. Continue to the **Refer** tab for a printable summary.")
+    # -------------------------------------------------------------------------------------------- call & refer
+    sel = next((r for r in res if r["facility_id"] == ss.sel), None)
+    if sel is None and res:
+        st.markdown("##### 📞 Call & refer")
+        st.caption("Press **Call & refer** on a facility to get a call checklist and a printable referral summary.")
+    elif sel is not None:
+        with st.container(border=True):
+            st.markdown(f"##### 📞 {md(sel['facility_name'])}")
+            st.markdown(f"**Phone:** {md(sel['phone'])}" if sel.get("phone") else "**Phone:** not listed: use the source link")
+            items = checklist(q["svc"])
+            chk = ss.checks.setdefault(sel["facility_id"], {})
+            st.caption("Ask before sending the patient:")
+            for i, item in enumerate(items[:4]):
+                chk[item] = st.checkbox(item, value=chk.get(item, False), key=f"c_{sel['facility_id']}_{i}")
+            with st.expander("More checks"):
+                for i, item in enumerate(items[4:], start=4):
+                    chk[item] = st.checkbox(item, value=chk.get(item, False), key=f"c_{sel['facility_id']}_{i}")
+            outcome = st.radio("Call outcome", STATUSES, horizontal=True, key=f"o_{sel['facility_id']}",
+                               index=STATUSES.index(ss.status.get(sel["facility_id"], "Not contacted")))
+            ss.status[sel["facility_id"]] = outcome
+            if outcome in BLOCKING_STATUSES:
+                alt = next_alternative(res, ss.status, exclude=sel["facility_id"])
+                if alt:
+                    st.warning(f"Next option: **{md(alt['facility_name'])}** ({alt['distance_km']:.1f} km)", icon="➡️")
+                    if st.button("Switch to next option", key="switch"):
+                        ss.sel = alt["facility_id"]
+                        st.rerun()
+                else:
+                    st.error("No other credible option in this radius. Widen the search or call 108 / the district referral desk.")
+            ss.notes = st.text_input("Notes (no patient names or numbers)", ss.notes, key="notes_box", max_chars=300)
+            text = referral_summary(q["label"], q["origin"], sel, res, outcome, chk, ss.notes, datetime.now(timezone.utc))
+            st.download_button("⬇️ Download referral summary", text, use_container_width=True, key="dl",
+                               file_name=f"careproof_referral_{datetime.now(timezone.utc):%Y%m%d_%H%M}.txt")
+            with st.expander("Preview summary"):
+                st.code(text, language=None)
 
-# ------------------------------------------------------------------------------------------------ REFER
-with refer_t:
-    if not results or ss.selected is None:
-        st.info("Select and verify a facility first.")
-    else:
-        sel = next(r for r in results if r["facility_id"] == ss.selected)
-        text = referral_summary(q["label"], q["origin"], sel, results, ss.statuses.get(sel["facility_id"], "Not contacted"),
-                                ss.checks.get(sel["facility_id"], {i: False for i in checklist(q["service"])}),
-                                ss.notes, datetime.now(timezone.utc))
-        st.code(text, language=None)
-        st.download_button("Download referral summary (.txt, print-friendly)", text,
-                           file_name=f"careproof_referral_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.txt",
-                           mime="text/plain", key="dl")
-        st.caption("The summary contains no patient information. Attach it to your own referral form if needed.")
+# ------------------------------------------------------------------------------------------------ audit
+with st.expander("🔍 Audit details: scores, full explanations, records held back"):
+    st.caption("Scores rank only facilities that passed every credibility gate. Weights are documented policy "
+               "choices (Bayesian-optimised under safety constraints), not probabilities.")
+    if res:
+        st.dataframe(pd.DataFrame([{"#": r["rank"], "facility": r["facility_name"], "evidence": r["evidence_label"],
+                                    **{COMPONENT_NAMES[k]: r[k] for k in COMPONENT_NAMES},
+                                    "penalty": r["data_quality_penalty"], "rank score": r["final_ranking_score"]}
+                                   for r in res]), hide_index=True, use_container_width=True)
+        for r in res:
+            st.markdown(f"**{r['rank']}. {md(r['facility_name'])}**: {md(r['explanation'])}")
+    if summ.get("held_back"):
+        st.markdown("**Held back (mention the service but failed a check):**")
+        st.dataframe(pd.DataFrame([{"facility": h["facility_name"], "km": h["distance_km"],
+                                    "why not": gate_reason_short(h["failed_gates"]),
+                                    "detail": " | ".join(h["reasons"])} for h in summ["held_back"]]),
+                     hide_index=True, use_container_width=True)

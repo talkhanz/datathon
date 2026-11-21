@@ -139,3 +139,59 @@ def render_cards_html(results, summary, title: str = "") -> str:
         out.append("</ul></details>")
     out.append("</div>")
     return "".join(out)
+
+
+
+# ---------------------------------------------------------------------------
+# Short, scannable reasons for the app cards (full text lives in the audit expander)
+# ---------------------------------------------------------------------------
+SHORT_FINDING = {
+    "COORDINATE_LOCATION_CONFLICT": "map position disagrees with its own PIN code",
+    "MULTIPLE_INCOMPATIBLE_LOCATIONS": "address mentions conflicting places",
+    "MULTIPLE_FACILITY_IDENTITIES": "record seems to describe another facility",
+    "SERVICE_CONTRADICTION": "text says the service is not offered here / referred elsewhere",
+    "SPECIALTY_PROFILE_MISMATCH": "facility type doesn't match this service",
+    "UNRESOLVED_LOCATION": "location is approximate or unknown",
+    "SHARED_PLACEHOLDER_COORDINATE": "shares map point with unrelated facilities",
+    "AMBIGUOUS_PIN": "PIN code spans several districts/states",
+    "MISSING_SOURCE_PROVENANCE": "no source link",
+    "POSSIBLE_DUPLICATE": "possible duplicate listing",
+    "WEAK_SERVICE_EVIDENCE": "service only weakly mentioned",
+    "MISSING_EVIDENCE_EXCERPT": "no sentence actually states the service",
+    "SUSPICIOUS_SOURCE_URL": "some source links look unrelated",
+}
+GATE_SHORT = {
+    "location_confidence_below_minimum": "unreliable location",
+    "identity_confidence_below_minimum": "unclear identity",
+    "high_severity_finding": "serious contradiction",
+    "probable_merged_or_misattributed_record": "probably a merged record",
+    "no_supporting_excerpt": "no supporting sentence",
+    "missing_provenance_fields": "missing provenance",
+}
+
+
+def gate_reason_short(failed_gates, findings=()) -> str:
+    """One plain-language reason why a record was not recommended."""
+    for f in findings:
+        if f.get("severity") == "high" and f.get("code") in SHORT_FINDING:
+            return SHORT_FINDING[f["code"]]
+    for g in failed_gates:
+        if g.startswith("evidence_conflicting"):
+            return "contradictory evidence"
+        if g.startswith("evidence_insufficient"):
+            return "no sentence actually states the service"
+        if g in GATE_SHORT:
+            return GATE_SHORT[g]
+    return "did not pass the credibility checks"
+
+
+def short_reasons(r: Mapping) -> dict:
+    """{'supported': str, 'caution': [str], 'unknown': str} - at most a few words each."""
+    fields = [f for f in r.get("matched_fields", []) if f != "specialties"]
+    sup = (f"Stated in its {r['evidence_field']}" + (f" + {len(fields) - 1} more field(s)" if len(fields) > 1 else "")
+           + (" · specialty tag agrees" if r.get("specialty_tags") else ""))
+    caution = [SHORT_FINDING[f["code"]] for f in r.get("findings", []) if f["code"] in SHORT_FINDING
+               and f["severity"] in ("medium", "low")][:2]
+    if r["evidence_category"] == "weak":
+        caution.insert(0, "mentioned only once")
+    return {"supported": sup, "caution": caution, "unknown": "Availability today unknown: call first"}

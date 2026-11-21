@@ -22,8 +22,8 @@ def fac(i, name, lat, lon, procedure="null", pin="800001", description="General 
             "longitude": str(lon), "facilityTypeId": "hospital", "officialWebsite": "null", "websites": "[]"}
 
 
-@pytest.fixture(scope="module")
-def built():
+def make_synthetic():
+    """Tiny synthetic dataset -> (silver, rejected_rows, gold). Shared with tests/test_inference.py."""
     pins = pd.DataFrame([{"circlename": "", "regionname": "", "divisionname": "", "officename": f"O{i}",
                           "pincode": "800001", "officetype": "PO", "delivery": "Delivery", "district": "PATNA",
                           "statename": "BIHAR", "latitude": str(25.61 + i * 0.001), "longitude": "85.14"}
@@ -44,6 +44,11 @@ def built():
     silver, quarantine, rep = P.build_facility_silver(raw, pin_silver)
     gold = P.build_facility_service_gold(silver, ["dialysis"])
     return silver, quarantine, gold
+
+
+@pytest.fixture(scope="module")
+def built():
+    return make_synthetic()
 
 
 LOC = ResolvedLocation(25.61, 85.14, "test", "user_coordinates")

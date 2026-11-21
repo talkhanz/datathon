@@ -1,4 +1,4 @@
-"""Headless Streamlit tests of the app against local Parquet (skipped if derived data or streamlit is absent)."""
+"""Headless Streamlit tests of the redesigned app against local Parquet (skipped if data or streamlit absent)."""
 import os
 
 import pytest
@@ -10,48 +10,47 @@ pytestmark = pytest.mark.skipif(not os.path.exists(os.path.join(DATA, "careproof
                                 reason="local derived data not built")
 
 
-def run_app(**widgets):
+def search(svc="dialysis", loc="800001", radius=25):
     os.environ["CAREPROOF_LOCAL_DATA"] = DATA
     at = st_testing.AppTest.from_file(os.path.join(ROOT, "app", "app.py"), default_timeout=180)
     at.run()
-    for key, val in widgets.items():  # set one at a time: some inputs appear only after an earlier choice
-        w = next((x for x in list(at.selectbox) + list(at.radio) + list(at.text_input) + list(at.slider) if x.key == key))
-        w.set_value(val)
-        at.run()
+    at.selectbox(key="svc").set_value(svc)
+    at.text_input(key="loc_text").set_value(loc)
+    at.selectbox(key="radius").set_value(radius)
     at.button(key="go").click().run()
     return at
 
 
-def all_text(at):
+def text(at):
     return " ".join([m.value for m in at.markdown] + [e.value for e in at.error] + [w.value for w in at.warning]
                     + [c.value for c in at.caption] + [i.value for i in at.info])
 
 
-def test_safety_banner_and_strong_results():
-    at = run_app(svc="dialysis", ltype="pincode", lval="800001", radius=25)
+def test_strong_results_and_safety_line():
+    at = search()
     assert not at.exception
-    t = all_text(at)
-    assert "does not provide medical advice" in t and "Patna Dialysis Centre" in t
-    assert "Current availability not verified" in t and "approx. straight-line" in t
+    t = text(at)
+    assert "Patna Dialysis Centre" in t and "Strong evidence" in t and "Not verified" in t
+    assert "Call the facility to confirm" in t
 
 
-def test_merged_record_location_abstains():
-    at = run_app(svc="dialysis", ltype="coordinates", lat="11.938235", lon="79.485443", radius=5)
+def test_coordinates_in_one_box_and_abstention():
+    at = search(loc="11.938235, 79.485443", radius=10)
     assert not at.exception
-    t = all_text(at)
-    assert "CareProof abstains" in t and "none had sufficiently consistent identity" in t
+    t = text(at)
+    assert "none had sufficiently consistent identity" in t and "is not shown" in t  # nearest keyword match explained
 
 
-def test_invalid_location_error():
-    at = run_app(svc="mri", ltype="pincode", lval="12345")
-    assert not at.exception and "not a valid Indian PIN code" in all_text(at)
+def test_invalid_location():
+    at = search(loc="12345")
+    assert not at.exception and "not a valid Indian PIN code" in text(at)
 
 
-def test_verify_unreachable_promotes_alternative():
-    at = run_app(svc="dialysis", ltype="pincode", lval="800001", radius=25)
-    first = at.session_state["results"][0]["facility_id"]
-    at.selectbox(key=f"status_{first}").set_value("Unreachable").run()
+def test_call_and_refer_flow_promotes_alternative():
+    at = search()
+    first = at.session_state["res"][0]["facility_id"]
+    at.button(key=f"pick_{first}").click().run()
+    at.radio(key=f"o_{first}").set_value("Unreachable").run()
     assert not at.exception
-    assert "Next eligible alternative" in all_text(at)
-    refer_code = " ".join(c.value for c in at.code)
-    assert "CAREPROOF REFERRAL SUMMARY" in refer_code and "Unreachable" in refer_code
+    assert "Next option" in text(at)
+    assert "CAREPROOF REFERRAL SUMMARY" in " ".join(c.value for c in at.code)

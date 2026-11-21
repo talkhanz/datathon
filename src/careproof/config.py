@@ -85,12 +85,15 @@ DEFAULT_TOP_K = 5
 @dataclass(frozen=True)
 class ScoringWeights:
     """Ranking weights for ELIGIBLE candidates only. Policy choices, not learned. Normalised to sum to 1."""
-    service_relevance: float = 0.15
-    evidence_strength: float = 0.30
-    identity_confidence: float = 0.15
-    location_confidence: float = 0.10
-    readiness_evidence: float = 0.10
-    distance: float = 0.20
+    # Default = Bayesian-optimised (Optuna TPE, 150 trials on the dev states, safety constraints enforced) and
+    # rounded; it dominated the hand-set policy on all three label-free KPIs on held-out test states, with small
+    # effects (docs/policy_optimization.md). Still a policy choice: these KPIs are not ranking correctness.
+    service_relevance: float = 0.05
+    evidence_strength: float = 0.35
+    identity_confidence: float = 0.14
+    location_confidence: float = 0.20
+    readiness_evidence: float = 0.02
+    distance: float = 0.24
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -107,6 +110,7 @@ DEFAULT_WEIGHTS = ScoringWeights()
 # Sensitivity scenarios (notebook 05). All are policy alternatives.
 WEIGHT_SCENARIOS = {
     "default": ScoringWeights(),
+    "hand_set_v1": ScoringWeights(0.15, 0.30, 0.15, 0.10, 0.10, 0.20),
     "distance_first": ScoringWeights(0.10, 0.20, 0.10, 0.10, 0.05, 0.45),
     "evidence_first": ScoringWeights(0.15, 0.45, 0.15, 0.10, 0.05, 0.10),
     "equal": ScoringWeights(1, 1, 1, 1, 1, 1),

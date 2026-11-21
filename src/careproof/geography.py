@@ -217,3 +217,20 @@ def resolve_location(location_type: str, location_value: str = "", latitude=None
                                 d, c["state"], warn)
 
     raise LocationError("location_type must be one of: pincode, coordinates, city, district.")
+
+
+_LATLON_RX = __import__("re").compile(r"^\s*(-?\d{1,2}(?:\.\d+)?)\s*[, ]\s*(-?\d{1,3}(?:\.\d+)?)\s*$")
+
+
+def resolve_free_text(text: str, index: PlaceIndex) -> ResolvedLocation:
+    """One input box: a 6-digit PIN, 'lat, lon', or a district/city name (optionally ', State')."""
+    t = (text or "").strip()
+    if not t:
+        raise LocationError("Enter a PIN code (e.g. 800001), a district (e.g. Patna, Bihar) or coordinates (e.g. 25.61, 85.14).")
+    digits = t.replace(" ", "")
+    if digits.isdigit():
+        return resolve_location("pincode", digits, index=index)
+    m = _LATLON_RX.match(t)
+    if m:
+        return resolve_location("coordinates", "", m.group(1), m.group(2), index)
+    return resolve_location("district", t, index=index)

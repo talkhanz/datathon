@@ -102,3 +102,17 @@ def test_coordinate_errors():
 def test_district_with_state_disambiguates():
     loc = resolve_location("district", "Bilaspur, Chhattisgarh", index=_index())
     assert loc.state == "CHHATTISGARH"
+
+
+def test_free_text_location_detection():
+    from careproof.geography import resolve_free_text
+    idx = _index()
+    assert resolve_free_text("800 001", idx).method == "pin_centroid"
+    assert resolve_free_text("25.6, 85.1", idx).method == "user_coordinates"
+    assert resolve_free_text("Bilaspur, Chhattisgarh", idx).state == "CHHATTISGARH"
+    with pytest.raises(LocationError, match="several states"):
+        resolve_free_text("Bilaspur", idx)
+    with pytest.raises(LocationError, match="not a valid"):
+        resolve_free_text("12345", idx)
+    with pytest.raises(LocationError, match="Enter a PIN"):
+        resolve_free_text("  ", idx)
