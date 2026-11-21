@@ -85,7 +85,7 @@ def run_benchmark(queries: pd.DataFrame, gold: pd.DataFrame, silver: pd.DataFram
                     "eligible_under_policy": bool(g["eligible"]),
                     "evidence_field": g["evidence_field"], "evidence_excerpt": g["evidence_excerpt"],
                     "flags": json.dumps(r["flags"]), "source_url": row.get("primary_source_url"),
-                    "label_service_supported (yes/no/unclear)": "", "reviewer": "", "notes": "",
+                    "label_service_supported": "", "reviewer": "", "notes": "",
                     "review_status": "PENDING_HUMAN_REVIEW",
                 })
         for r in res:
@@ -208,7 +208,7 @@ def compare_baselines(queries: pd.DataFrame, gold: pd.DataFrame, silver: pd.Data
 # ---------------------------------------------------------------------------
 # Label-based metrics: computed ONLY from human labels; returns PENDING if none exist.
 # ---------------------------------------------------------------------------
-LABEL_COL = "label_service_supported (yes/no/unclear)"
+LABEL_COL = "label_service_supported"
 
 
 def label_metrics(labels: pd.DataFrame, k: int = 5) -> pd.DataFrame:
