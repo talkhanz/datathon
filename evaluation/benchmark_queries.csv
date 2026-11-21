@@ -1,0 +1,24 @@
+query_id,category,service_input,location_type,location_value,latitude,longitude,max_distance_km,top_k,expected_outcome,notes
+Q01,urban|exact,dialysis,pincode,800001,,,25,5,results,Patna GPO; challenge example (Bihar dialysis)
+Q02,urban|synonym,haemodialysis,district,"Patna, Bihar",,,25,5,results,synonym of dialysis; district resolution
+Q03,rural|exact,dialysis,district,"Gaya, Bihar",,,100,5,results,rural Bihar
+Q04,urban|exact,emergency c-section,pincode,400001,,,25,5,results,Mumbai; challenge example (Maharashtra high-risk delivery)
+Q05,rural|synonym,caesarean,district,Nandurbar,,,150,5,results,tribal district in Maharashtra
+Q06,urban|exact,NICU,pincode,560001,,,25,5,results,Bengaluru
+Q07,rural|synonym,neonatal intensive care,district,Bahraich,,,150,5,results,rural Uttar Pradesh
+Q08,urban|exact,MRI,pincode,110001,,,25,5,results,New Delhi
+Q09,urban|synonym,magnetic resonance imaging,pincode,520001,,,25,5,results,Vijayawada; baseline top-1 is not explicit
+Q10,urban|exact,cardiac surgery,pincode,380001,,,25,5,results,Ahmedabad
+Q11,urban|synonym,open heart surgery,pincode,600001,,,25,5,results,Chennai
+Q12,urban|exact,burn care,pincode,400001,,,25,5,results,Mumbai; baseline top-1 is a skin clinic
+Q13,rural|exact,burn care,district,Koraput,,,200,5,results,rural Odisha; sparse supply
+Q14,highway|exact,trauma,coordinates,,26.2183,78.1828,50,5,results,NH44 near Gwalior (challenge example: highway trauma)
+Q15,urban|exact,trauma care,pincode,226001,,,25,5,results,Lucknow
+Q16,ambiguous_pin,dialysis,pincode,110003,,,25,5,results_with_warning,PIN spans multiple districts; must surface ambiguity
+Q17,missing_coords,dialysis,pincode,176057,,,50,5,location_error,PIN with no coordinates in India Post directory
+Q18,ambiguous_place,dialysis,district,Aurangabad,,,50,5,location_error,district name exists in Bihar and Maharashtra
+Q19,invalid_input,mri,pincode,12345,,,25,5,location_error,five-digit PIN
+Q20,contradictory_record,dialysis,coordinates,,11.938235,79.485443,5,5,results,location of a merged 'Aravind Eye Hospital' record that claims a dialysis unit
+Q21,inconsistent_pin_coords,dialysis,pincode,500001,,,25,5,location_error,PIN whose offices disagree on location (inconsistent coordinates)
+Q22,swapped_coords,nicu,coordinates,,77.2090,28.6139,25,5,location_error,lat/lon swapped by user
+Q23,duplicate_records,trauma,coordinates,,30.3340,76.4000,25,5,results,Patiala city centre; two near-identical Rajindra Hospital Patiala records; both must carry possible_duplicate flag

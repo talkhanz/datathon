@@ -1,0 +1,29 @@
+# Raw and derived data (licences not confirmed for redistribution)
+data/raw/*
+data/derived/*
+*.csv
+!evaluation/benchmark_queries.csv
+*.parquet
+*.pkl
+evaluation/*_LOCAL.csv
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv*/
+venv/
+*.egg-info/
+
+# Secrets / local settings
+.env
+.env.*
+*.pem
+*.key
+.databrickscfg
+.claude/settings.local.json
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
