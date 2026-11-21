@@ -149,3 +149,30 @@ def test_exact_quotation_preserved(built):
     for r in res:
         src = silver.set_index("facility_id").loc[r["facility_id"]]
         assert r["evidence_excerpt"] in (src[r["evidence_field"]] or "")
+
+
+def test_spark_values_use_null_not_nan():
+    """Regression: NaN must become None (SQL NULL); found when Databricks stored NaN DOUBLEs."""
+    import numpy as np
+    kind, vals = P.spark_column_values(pd.Series([1.5, np.nan, None]))
+    assert kind == "double" and vals == [1.5, None, None]
+    kind, vals = P.spark_column_values(pd.Series([True, None, False], dtype=object))
+    assert kind == "boolean" and vals == [True, None, False]
+    kind, vals = P.spark_column_values(pd.Series(["a", None, np.nan], dtype=object))
+    assert kind == "string" and vals == ["a", None, None]
+    assert P.spark_column_values(pd.Series([1, 2]))[0] == "long"
+
+
+def test_unrecognised_state_is_not_a_state_conflict():
+    """Regression: a city in the state field (state_norm missing -> NaN after join) must not count as a conflict."""
+    pins = pd.DataFrame([{"circlename": "", "regionname": "", "divisionname": "", "officename": f"O{i}",
+                          "pincode": "400103", "officetype": "PO", "delivery": "Delivery", "district": "MUMBAI",
+                          "statename": "MAHARASHTRA", "latitude": "19.20", "longitude": "72.85"} for i in range(3)])
+    rows = [{**fac(1, "Karuna Hospital", 19.201, 72.851, procedure='["Dialysis"]', pin="400103"),
+             "address_stateOrRegion": "Mumbai"},
+            {**fac(2, "Real Conflict Hospital", 19.202, 72.852, procedure='["Dialysis"]', pin="400103"),
+             "address_stateOrRegion": "Gujarat"}]
+    silver, _, _ = P.build_facility_silver(pd.DataFrame(rows)[COLS], P.build_pincode_silver(pins))
+    sc = dict(zip(silver["name"], silver["state_conflict"]))
+    assert sc["Karuna Hospital"] is False or sc["Karuna Hospital"] == False  # noqa: E712
+    assert bool(sc["Real Conflict Hospital"]) is True

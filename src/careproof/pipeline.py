@@ -237,7 +237,8 @@ def build_facility_silver(raw: pd.DataFrame, pin_silver: pd.DataFrame):
     df = df.drop(columns="pin_coords_defensible_b")
 
     def _state_conflict(r):
-        if not r.state_norm or not isinstance(r.pin_states_json, str):
+        # NB: after the join a missing state is NaN, which is truthy - test with isinstance, not truthiness.
+        if not isinstance(r.state_norm, str) or not r.state_norm or not isinstance(r.pin_states_json, str):
             return False
         states = json.loads(r.pin_states_json)
         return bool(states) and r.state_norm not in states
@@ -682,3 +683,22 @@ def coerce_pin_types(p: pd.DataFrame) -> pd.DataFrame:
         if c in p:
             p[c] = _to_bool(p[c])
     return p
+
+
+def spark_column_values(s: pd.Series):
+    """(kind, python_values) for building a Spark DataFrame with an explicit schema.
+
+    Missing values become real None (SQL NULL), never float NaN: pandas `.map` on a float column silently turns
+    None back into NaN, which Spark would store as a NaN DOUBLE that is NOT NULL in SQL.
+    """
+    def missing(v):
+        return v is None or v is pd.NA or (isinstance(v, float) and v != v)
+    nn = [v for v in s.tolist() if not missing(v)]
+    if pd.api.types.is_bool_dtype(s) or (nn and all(isinstance(v, (bool, np.bool_)) for v in nn)):
+        return "boolean", [None if missing(v) else bool(v) for v in s.tolist()]
+    if pd.api.types.is_integer_dtype(s):
+        return "long", [None if missing(v) else int(v) for v in s.tolist()]
+    if pd.api.types.is_float_dtype(s) or (nn and all(isinstance(v, (int, float, np.integer, np.floating))
+                                                    and not isinstance(v, (bool, np.bool_)) for v in nn)):
+        return "double", [None if missing(v) else float(v) for v in s.tolist()]
+    return "string", [None if missing(v) else str(v) for v in s.tolist()]

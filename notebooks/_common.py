@@ -92,24 +92,15 @@ def spark_to_pandas_str(sdf):
 
 
 def pandas_to_spark(pdf: pd.DataFrame):
-    """Explicit-schema conversion (avoids inference problems with None / mixed object columns)."""
-    fields, data = [], {}
+    """Explicit-schema conversion; missing values become SQL NULL (never NaN). Logic tested locally in
+    tests/test_pipeline.py via pipeline.spark_column_values."""
+    types = {"boolean": T.BooleanType(), "long": T.LongType(), "double": T.DoubleType(), "string": T.StringType()}
+    fields, cols = [], []
     for c in pdf.columns:
-        s = pdf[c]
-        nn = s.dropna()
-        if pd.api.types.is_bool_dtype(s) or (len(nn) and nn.map(lambda v: isinstance(v, (bool, np.bool_))).all()):
-            fields.append(T.StructField(c, T.BooleanType(), True))
-            data[c] = s.map(lambda v: None if v is None or (isinstance(v, float) and v != v) else bool(v))
-        elif pd.api.types.is_integer_dtype(s):
-            fields.append(T.StructField(c, T.LongType(), True))
-            data[c] = s.map(lambda v: None if pd.isna(v) else int(v))
-        elif pd.api.types.is_float_dtype(s) or (len(nn) and nn.map(lambda v: isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, (bool, np.bool_))).all()):
-            fields.append(T.StructField(c, T.DoubleType(), True))
-            data[c] = s.map(lambda v: None if v is None or pd.isna(v) else float(v))
-        else:
-            fields.append(T.StructField(c, T.StringType(), True))
-            data[c] = s.map(lambda v: None if v is None or (isinstance(v, float) and v != v) else str(v))
-    rows = list(zip(*[data[c].tolist() for c in pdf.columns])) if len(pdf) else []
+        kind, vals = pipeline.spark_column_values(pdf[c])
+        fields.append(T.StructField(c, types[kind], True))
+        cols.append(vals)
+    rows = list(zip(*cols)) if len(pdf) else []
     return spark.createDataFrame(rows, T.StructType(fields))  # noqa: F821
 
 
