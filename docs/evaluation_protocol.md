@@ -31,17 +31,18 @@ demo-critical and high-risk pair (merged, negation, geographic contradiction), a
 | Ranking stability | top-1 / Jaccard across weight scenarios | `run_benchmark` | measured |
 | Comparison vs nearest keyword match | all of the above for B1–B4 | `compare_baselines` | label-free measured |
 
-## Current measured results (local CSV build, 2026-11-21; re-run in notebook 05 on Databricks)
+## Current measured results (Databricks notebook 05, 2026-11-21)
 Random sample (56 queries):
-* unsupported-recommendation rate: **B3 nearest synonym 33.0%**, B2 exact word 31.7%, B1 nearest any 92.3%,
+* unsupported-recommendation rate: **B3 nearest synonym 31.9%**, B2 exact word 29.7%, B1 nearest any 92.3%,
   **CareProof 0.0%** (true by construction, since CareProof only shows eligible rows; the informative numbers
   are the baselines');
 * coverage 46/56 for CareProof (82.1%) vs 47/56 for B3 (83.9%). Of 10 CareProof abstentions, 6 had mentions that
   were all held back;
 * exact-substring citations 169/169; geographically valid results 169/169; results by category: 43 strong,
   84 moderate, 42 weak;
+* held-out test split (21 queries, separate states): B3 32.0% unsupported, CareProof coverage 81.0%;
 * top-1 differs from B3 in 31/56; top-1 unchanged under alternative weights in 45–52/56;
-* latency (warm, local): CareProof p50 16.6 ms, p95 26.2 ms.
+* latency (warm, Databricks): CareProof p50 7.4 ms, p95 15.0 ms.
 
 Precision@K, quarantine precision/recall, retrieval recall and appropriate-abstention rate: **PENDING HUMAN REVIEW.**
 No value will be reported until labels exist.

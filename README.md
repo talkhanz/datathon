@@ -150,17 +150,17 @@ keyword baseline; benchmark with automatic metrics; HTML result cards.
 **Implemented, Databricks run pending:** notebooks 00–05 and the SQL validation queries. They were written against
 the local schema; notebook 01 reports any schema differences on Databricks.
 
-**Measured** (local CSV build, 2026-11-21; re-measure on Databricks in notebook 05). Random sample of 56 queries
+**Measured on Databricks** (notebook 05, serverless, 2026-11-21; local build gives identical eligibility counts). Random sample of 56 queries
 (seeded, stratified by service × district rurality, split dev/test by state):
 
 | Metric | Value |
 |---|---|
-| **Unsupported recommendation rate** (shown results failing the evidence gates) | nearest-synonym baseline **33.0%** · exact-word baseline 31.7% · CareProof 0% (by construction) |
+| **Unsupported recommendation rate** (shown results failing the evidence gates) | nearest-synonym baseline **31.9%** · exact-word baseline 29.7% · CareProof 0% (by construction) |
 | Coverage (queries with ≥1 eligible result) | 46 / 56; of 10 abstentions, 6 had mentions that were all held back |
 | Exact-substring citations · valid locations | 169 / 169 · 169 / 169 |
 | Results by evidence category | 43 strong · 84 moderate · 42 weak |
 | Top-1 unchanged under 4 alternative weight policies | 45–52 / 56 |
-| Latency per query (warm, local) | p50 16.6 ms · p95 26.2 ms |
+| Latency per query (warm, Databricks serverless driver) | p50 7.4 ms · p95 15.0 ms |
 | **Precision@K, quarantine precision/recall, retrieval recall** | **PENDING HUMAN REVIEW** (142-pair blind review sheet + query labeling template) |
 
 CareProof's 0% unsupported rate is by construction. The baselines' rates are the informative numbers.

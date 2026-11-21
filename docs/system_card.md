@@ -27,9 +27,9 @@ and no LLM in the decision path (no independent labels exist, so training would 
 **Evaluation data:** curated behaviour benchmark (23 queries); seeded random query sample (56, state-grouped
 dev/test); stratified facility-service pair benchmark (142). See `evaluation_protocol.md`.
 
-**Metrics (local CSV build, 2026-11-21):** unsupported-recommendation rate of the nearest-synonym baseline 33.0% vs
+**Metrics (Databricks notebook 05, 2026-11-21):** unsupported-recommendation rate of the nearest-synonym baseline 31.9% vs
 CareProof 0% by construction; coverage 46/56; exact citations 169/169; valid locations 169/169; top-1 stable under
-alternative weights in 45–52/56; p50 latency 16.6 ms. **Precision@K, quarantine precision/recall, retrieval recall:
+alternative weights in 45–52/56; p50 latency 7.4 ms. **Precision@K, quarantine precision/recall, retrieval recall:
 pending human review.**
 
 **Subgroups:** coverage collapses in rural districts (most rural quartile: 2% of facilities, and 114/189 districts
