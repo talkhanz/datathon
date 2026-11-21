@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from typing import Mapping
 
+import numpy as np
 import pandas as pd
 
 from .config import WEIGHT_SCENARIOS, INDIA_LAT_RANGE, INDIA_LON_RANGE
@@ -35,15 +36,17 @@ def run_benchmark(queries: pd.DataFrame, gold: pd.DataFrame, silver: pd.DataFram
                                    q.get("latitude"), q.get("longitude"), index)
         except LocationError as e:
             qrows.append({**base, "status": "location_error", "message": str(e), "n_results": 0,
-                          "outcome_as_expected": q["expected_outcome"] == "location_error",
+                          "outcome_as_expected": None if q["expected_outcome"] == "unknown"
+                          else q["expected_outcome"] == "location_error",
                           "location_warning": None})
             continue
         maxkm, k = float(q["max_distance_km"]), int(q["top_k"])
         runs = {name: recommend(gold, loc, svc, maxkm, k, w)[0] for name, w in WEIGHT_SCENARIOS.items()}
         res = runs["default"]
         bl = keyword_baseline(gold, loc, svc, maxkm, k)
-        exp_ok = (q["expected_outcome"] == "results" and len(res) > 0) or \
-                 (q["expected_outcome"] == "results_with_warning" and len(res) > 0 and bool(loc.warnings))
+        exp_ok = None if q["expected_outcome"] == "unknown" else (
+            (q["expected_outcome"] == "results" and len(res) > 0) or
+            (q["expected_outcome"] == "results_with_warning" and len(res) > 0 and bool(loc.warnings)))
         default_ids = [r["facility_id"] for r in res]
         stab = {}
         for name, rr in runs.items():
@@ -98,8 +101,12 @@ def summarize(qdf: pd.DataFrame) -> dict:
     ans = qdf[qdf.expected_outcome.isin(["results", "results_with_warning"])]
     out = {
         "queries_total": int(len(qdf)),
-        "outcome_as_expected": f"{int(qdf.outcome_as_expected.sum())}/{len(qdf)}",
+        "outcome_as_expected": (f"{int(qdf.outcome_as_expected.dropna().astype(bool).sum())}/"
+                                f"{int(qdf.outcome_as_expected.notna().sum())}" if qdf.outcome_as_expected.notna().any()
+                                else "n/a (no expected outcomes: unbiased random sample)"),
+        "coverage_queries_with_results": f"{int((ok.n_results > 0).sum())}/{len(qdf)}",
         "coverage_answerable_queries_with_results": f"{int((ans.n_results > 0).sum())}/{len(ans)}",
+        "abstained_no_evidence_in_radius": int(((qdf.status == "ok") & (qdf.n_results == 0)).sum()),
         "citation_exact_substring_rate": _rate(ok.citations_exact.sum(), ok.citations_total.sum()),
         "geographic_validity_rate": _rate(ok.geo_valid.sum(), ok.geo_total.sum()),
         "careproof_results_with_contradiction_flags": f"{int(ok.cp_with_contradiction_flags.sum())}/{int(ok.n_results.sum())}",
@@ -117,3 +124,137 @@ def summarize(qdf: pd.DataFrame) -> dict:
 
 def _rate(a, b):
     return f"{int(a)}/{int(b)} = {a / b:.1%}" if b else "n/a"
+
+
+# ---------------------------------------------------------------------------
+# Baseline comparison (B1-B4) with latency. Label-free metrics only; label metrics below.
+# ---------------------------------------------------------------------------
+import time as _time
+
+from .pipeline import nearest_any_baseline
+
+SYSTEMS = ("B1_nearest_any", "B2_nearest_exact_word", "B3_nearest_synonym", "B4_careproof")
+
+
+def _run_system(name, gold, silver, loc, svc, maxkm, k):
+    if name == "B1_nearest_any":
+        return nearest_any_baseline(silver, loc, maxkm, k)
+    if name == "B2_nearest_exact_word":
+        return keyword_baseline(gold, loc, svc, maxkm, k, column="baseline_exact_term_hit")
+    if name == "B3_nearest_synonym":
+        return keyword_baseline(gold, loc, svc, maxkm, k)
+    return recommend(gold, loc, svc, maxkm, k)[0]
+
+
+def compare_baselines(queries: pd.DataFrame, gold: pd.DataFrame, silver: pd.DataFrame, index, repeats: int = 3):
+    """Per-system label-free metrics over answerable queries + latency (p50/p95 over repeats x queries)."""
+    gsvc = {s: gold[gold.service == s] for s in gold.service.unique()}
+    status = {(r.facility_id, r.service): (r.evidence_level, json.loads(r.flags_json)) for r in gold.itertuples()}
+    rows, lat = [], {s: [] for s in SYSTEMS}
+    for q in queries.to_dict("records"):
+        svc = resolve_service(q["service_input"]).key
+        try:
+            loc = resolve_location(q["location_type"], str(q.get("location_value") or ""), q.get("latitude"),
+                                   q.get("longitude"), index)
+        except LocationError:
+            continue
+        maxkm, k = float(q["max_distance_km"]), int(q["top_k"])
+        g = gsvc.get(svc, gold.iloc[0:0])
+        for name in SYSTEMS:
+            res = None
+            for _ in range(repeats):
+                t0 = _time.perf_counter()
+                res = _run_system(name, g, silver, loc, svc, maxkm, k)
+                lat[name].append((_time.perf_counter() - t0) * 1000)
+            lv = [status.get((r["facility_id"], svc), ("no_signal", []))[0] for r in res]
+            fl = [status.get((r["facility_id"], svc), ("no_signal", []))[1] for r in res]
+            rows.append({"query_id": q["query_id"], "system": name, "n_results": len(res),
+                         "n_explicit_evidence": sum(v == "explicit_text" for v in lv),
+                         "n_no_or_tag_only_evidence": sum(v in ("no_signal", "none", "specialty_tag_only") for v in lv),
+                         "n_negated": sum(v == "negated_only" for v in lv),
+                         "n_contradiction_flag": sum(bool(CONTRA & set(f)) for f in fl),
+                         "top1_explicit_clean": bool(res) and lv[0] == "explicit_text" and not (CONTRA & set(fl[0]))})
+    per = pd.DataFrame(rows)
+    agg = per.groupby("system").agg(queries=("query_id", "nunique"), results=("n_results", "sum"),
+                                    coverage=("n_results", lambda x: (x > 0).mean()),
+                                    explicit=("n_explicit_evidence", "sum"), weak=("n_no_or_tag_only_evidence", "sum"),
+                                    negated=("n_negated", "sum"), contra=("n_contradiction_flag", "sum"),
+                                    top1_clean=("top1_explicit_clean", "mean")).reindex(list(SYSTEMS))
+    agg["pct_results_with_explicit_evidence"] = (100 * agg.explicit / agg.results).round(1)
+    agg["pct_results_no_or_tag_only_evidence"] = (100 * agg.weak / agg.results).round(1)
+    agg["pct_results_with_contradiction"] = (100 * agg.contra / agg.results).round(1)
+    agg["pct_top1_explicit_and_uncontradicted"] = (100 * agg.top1_clean).round(1)
+    agg["coverage_pct"] = (100 * agg.coverage).round(1)
+    agg["latency_ms_p50"] = [round(float(np.percentile(lat[s], 50)), 2) for s in agg.index]
+    agg["latency_ms_p95"] = [round(float(np.percentile(lat[s], 95)), 2) for s in agg.index]
+    keep = ["queries", "results", "coverage_pct", "pct_results_with_explicit_evidence",
+            "pct_results_no_or_tag_only_evidence", "negated", "pct_results_with_contradiction",
+            "pct_top1_explicit_and_uncontradicted", "latency_ms_p50", "latency_ms_p95"]
+    return agg[keep].reset_index(), per
+
+
+# ---------------------------------------------------------------------------
+# Label-based metrics: computed ONLY from human labels; returns PENDING if none exist.
+# ---------------------------------------------------------------------------
+LABEL_COL = "label_service_supported (yes/no/unclear)"
+
+
+def label_metrics(labels: pd.DataFrame, k: int = 5) -> pd.DataFrame:
+    """Precision@K and NDCG@K per system from a filled labeling template (yes=1, no=0, unclear excluded)."""
+    lab = labels[labels[LABEL_COL].astype(str).str.strip().str.lower().isin(["yes", "no"])].copy()
+    if lab.empty:
+        return pd.DataFrame([{"status": "PENDING_HUMAN_REVIEW", "labeled_rows": 0}])
+    lab["rel"] = (lab[LABEL_COL].str.strip().str.lower() == "yes").astype(int)
+    lab = lab[lab["rank"].astype(int) <= k]
+    out = []
+    for (sysname, qid), d in lab.groupby(["system", "query_id"]):
+        d = d.sort_values("rank")
+        rel = d.rel.tolist()
+        dcg = sum(r / np.log2(i + 2) for i, r in enumerate(rel))
+        idcg = sum(r / np.log2(i + 2) for i, r in enumerate(sorted(rel, reverse=True)))
+        out.append({"system": sysname, "query_id": qid, "precision_at_k": np.mean(rel),
+                    "ndcg_at_k_within_labeled": dcg / idcg if idcg else 0.0, "n_labeled": len(rel)})
+    o = pd.DataFrame(out)
+    return o.groupby("system").agg(queries=("query_id", "nunique"), labeled=("n_labeled", "sum"),
+                                   precision_at_k=("precision_at_k", "mean"),
+                                   ndcg_at_k=("ndcg_at_k_within_labeled", "mean")).round(3).reset_index()
+
+
+# ---------------------------------------------------------------------------
+# Unbiased query sample for labeling (frozen before results are inspected) + group-aware split.
+# ---------------------------------------------------------------------------
+LABELING_SEED = 20261121
+SAMPLE_SERVICES = ("dialysis", "c-section", "nicu", "mri", "cardiac surgery", "burn care", "trauma")
+
+
+def make_labeling_queries(pin_silver: pd.DataFrame, pin_raw: pd.DataFrame, per_cell: int = 2,
+                          seed: int = LABELING_SEED, max_distance_km: float = 100.0, top_k: int = 5) -> pd.DataFrame:
+    """Stratified random sample: service x district-rurality quartile x `per_cell` PINs.
+
+    Only PINs with a defensible, unambiguous centroid are eligible (so the sample tests ranking, not geocoding;
+    geocoding failures are covered by the curated benchmark). Split is by STATE (group-aware): all queries of a
+    state fall in the same split, which prevents leakage through shared facilities and nearby locations.
+    """
+    from .eda import district_rurality_proxy
+    rur = district_rurality_proxy(pin_raw)
+    rur["quartile"] = pd.qcut(rur.bo_share.rank(method="first"), 4, labels=["Q1_urban", "Q2", "Q3", "Q4_rural"])
+    p = pin_silver[pin_silver.coords_defensible.astype(bool) & ~pin_silver.is_ambiguous.astype(bool)]
+    p = p.merge(rur, left_on=["primary_district", "primary_state"], right_on=["district", "state"])
+    rng = np.random.default_rng(seed)
+    states = sorted(p.primary_state.unique())
+    rng.shuffle(states)
+    test_states = set(states[: max(1, int(round(0.3 * len(states))))])
+    rows, n = [], 0
+    for svc in SAMPLE_SERVICES:
+        for qt in ["Q1_urban", "Q2", "Q3", "Q4_rural"]:
+            cell = p[p.quartile == qt].sort_values("pincode")
+            pick = cell.iloc[rng.choice(len(cell), size=min(per_cell, len(cell)), replace=False)]
+            for r in pick.itertuples():
+                n += 1
+                rows.append({"query_id": f"L{n:03d}", "category": f"random|{qt}", "service_input": svc,
+                             "location_type": "pincode", "location_value": r.pincode, "latitude": "", "longitude": "",
+                             "max_distance_km": max_distance_km, "top_k": top_k, "expected_outcome": "unknown",
+                             "state": r.primary_state, "district": r.primary_district,
+                             "split": "test" if r.primary_state in test_states else "dev",
+                             "notes": f"seed={seed}; frozen before inspecting results"})
+    return pd.DataFrame(rows)

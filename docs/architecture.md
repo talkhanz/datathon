@@ -52,12 +52,14 @@ nfhs_5_district_health_indicators ─02─► careproof_nfhs_silver (long: distr
 Defaults: service 0.30, evidence 0.25, location 0.10, distance 0.25, readiness 0.10.
 * `service_match_score` is the strength of the strongest field with a positive mention (procedure or equipment 1.0,
   capability or description 0.9, name 0.7).
-* `evidence_confidence_score` is corroboration: 1 field 0.5, 2 fields 0.75, 3 or more 0.9; plus 0.1 for a related
-  specialty tag and 0.05 for specific detail (counts, "unit", "ward", …).
+* `evidence_confidence_score` is corroboration measured in **distinct supporting statements**, with near-duplicates
+  collapsed, because the fields are LLM extractions of the same pages: 1 statement 0.5, 2 statements 0.75, 3 or more
+  0.9; plus 0.1 for a related specialty tag and 0.05 for specific detail (counts, "unit", "ward", …).
 * `location_quality_score` is 1.0 if the coordinates are within 5 km of the facility's own PIN centroid, 0.8 within
   25 km, 0.3 beyond 25 km, 0.6 if this can't be checked, and 0.4 if the position comes from the PIN centroid; minus
   0.2 for a state conflict.
-* `distance_score` is `1 − d / max_distance_km`.
+* `distance_score` is `1 / (1 + d / 15 km)`, a fixed decay that does not depend on the search radius. The radius
+  only filters candidates and never reorders them (a test enforces this).
 * `readiness_score` is 0.5 × (24x7 stated with the service = 1, elsewhere = 0.5) + 0.5 × (dedicated unit or
   quantity stated). Beds and doctor counts are deliberately **not** used.
 * Penalties: negated mention 0.20, specialty mismatch 0.25, location conflict 0.15, state conflict 0.10, suspicious
@@ -65,3 +67,5 @@ Defaults: service 0.30, evidence 0.25, location 0.10, distance 0.25, readiness 0
 * Confidence is **High** if service ≥ 0.9, evidence ≥ 0.7, penalty ≤ 0.05 and location ≥ 0.6. It is **Low** if
   evidence < 0.5, penalty ≥ 0.25 or location < 0.4. Everything else is **Medium**.
 * Tie-break: final score descending, then distance ascending, then `facility_id` ascending.
+* After ranking: same-name records within 1 km are collapsed and disclosed. The status is `answered`,
+  `answered_low_confidence_only` or `abstain_no_explicit_evidence_in_radius`.

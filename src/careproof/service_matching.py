@@ -241,6 +241,8 @@ def _window(text: str, a: int, b: int, ms: int, me: int) -> str:
 
 
 def _scan(text: str, fld: str, rx: re.Pattern) -> list[Hit]:
+    if not rx.search(text):  # fast path: most items never mention the service
+        return []
     hits = []
     for a, b in _units(text):
         unit = text[a:b]
@@ -252,24 +254,64 @@ def _scan(text: str, fld: str, rx: re.Pattern) -> list[Hit]:
     return hits
 
 
+def _stmt_key(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", text.lower())).strip()
+
+
+def count_distinct_statements(excerpts) -> int:
+    """Number of distinct statements after normalisation; a statement contained in another counts once."""
+    kept: list[str] = []
+    for k in sorted({_stmt_key(e) for e in excerpts if e}, key=len, reverse=True):
+        if k and not any(k in d for d in kept):
+            kept.append(k)
+    return len(kept)
+
+
 def name_profiles(name: Optional[str]) -> list[str]:
     n = name or ""
     return [k for k, rx in _PROFILE_RX.items() if rx.search(n)]
 
 
-def match_service(record: Mapping, service_key: str) -> ServiceMatch:
-    """Match one facility record (raw or silver fields) against one service."""
+@dataclass(frozen=True)
+class ParsedRecord:
+    """A facility's text fields parsed once and reused for every service (inference optimisation)."""
+    arrays: dict
+    strings: dict
+    specialties: tuple
+    name: Optional[str]
+    facility_type: str
+    any_24x7: bool
+    keyword_blob: str
+
+
+def parse_record(record: Mapping) -> ParsedRecord:
+    if isinstance(record, ParsedRecord):
+        return record
+    arrays = {f: tuple(parse_array(record.get(f))) for f in ARRAY_FIELDS}
+    strings = {f: clean_str(record.get(f)) for f in STRING_FIELDS}
+    specialties = tuple(parse_array(record.get("specialties")))
+    any24 = any(_24X7.search(i) for f in ARRAY_FIELDS for i in arrays[f]) or bool(_24X7.search(strings["description"] or ""))
+    blob = " ".join(
+        [" ".join(parse_array(record.get(f), dedupe=False)) for f in (*ARRAY_FIELDS, "specialties")]
+        + [strings[f] or "" for f in STRING_FIELDS]).lower()
+    return ParsedRecord(arrays, strings, specialties, strings["name"],
+                        (clean_str(record.get("facilityTypeId")) or "").lower(), any24, blob)
+
+
+def match_service(record, service_key: str) -> ServiceMatch:
+    """Match one facility record (raw/silver mapping, or a ParsedRecord) against one service."""
+    rec = parse_record(record)
     sdef = TAXONOMY[service_key]
     strong_rx, tag_rx = _COMPILED[service_key]
     hits: list[Hit] = []
     for f in ARRAY_FIELDS:
-        for item in parse_array(record.get(f)):
+        for item in rec.arrays[f]:
             hits.extend(_scan(item, f, strong_rx))
     for f in STRING_FIELDS:
-        s = clean_str(record.get(f))
+        s = rec.strings[f]
         if s:
             hits.extend(_scan(s, f, strong_rx))
-    tags = [t for t in parse_array(record.get("specialties")) if tag_rx.search(t)]
+    tags = [t for t in rec.specialties if tag_rx.search(t)]
     # Exclude eye-trauma style tags explicitly
     tags = [t for t in tags if not re.search(r"^eye|eyeTrauma|emergencyEye|dent", t, re.I)]
 
@@ -280,8 +322,8 @@ def match_service(record: Mapping, service_key: str) -> ServiceMatch:
     conflicts, missing = [], []
     if neg:
         conflicts.append("negated_mention")
-    profiles = [p for p in name_profiles(clean_str(record.get("name"))) if p not in sdef.profile_exempt]
-    ftype = (clean_str(record.get("facilityTypeId")) or "").lower()
+    profiles = [p for p in name_profiles(rec.name) if p not in sdef.profile_exempt]
+    ftype = rec.facility_type
     if pos and (profiles or ftype in INCOMPATIBLE_FACILITY_TYPES):
         conflicts.append("specialty_mismatch")
 
@@ -289,19 +331,24 @@ def match_service(record: Mapping, service_key: str) -> ServiceMatch:
         level = "explicit_text"
         smatch = max(FIELD_STRENGTH[h.field] for h in pos)
         n = len(fields_pos)
-        conf = {1: 0.5, 2: 0.75}.get(n, 0.9)
+        # Corroboration counts DISTINCT supporting statements, not fields: the source pipeline extracted
+        # procedure/capability/equipment with an LLM from the same pages, so the same sentence often recurs
+        # across fields (observed in ~10% of multi-field claims). Repeats are not independent evidence.
+        n_stmt = count_distinct_statements([h.excerpt for h in pos])
+        conf = {1: 0.5, 2: 0.75}.get(n_stmt, 0.9)
         if tags:
             conf += 0.1
         if any(h.has_detail for h in pos):
             conf += 0.05
         conf = min(1.0, conf)
-        if n == 1:
-            missing.append(f"service stated only in '{fields_pos[0]}' field")
+        if n_stmt == 1:
+            missing.append("only one distinct supporting statement" +
+                           (f" (repeated across {n} fields)" if n > 1 else f" (in '{fields_pos[0]}')"))
         if not tags:
             missing.append("no related specialty tag")
         in_unit_24 = any(h.has_24x7 for h in pos)
         detail = any(h.has_detail for h in pos)
-        facility_24 = _facility_mentions_24x7(record)
+        facility_24 = rec.any_24x7
         readiness = 0.5 * (1.0 if in_unit_24 else 0.5 if facility_24 else 0.0) + 0.5 * (1.0 if detail else 0.0)
     elif tags:
         level, smatch, conf, readiness = "specialty_tag_only", SPECIALTY_ONLY_STRENGTH, 0.2, 0.0
@@ -341,19 +388,22 @@ def match_service(record: Mapping, service_key: str) -> ServiceMatch:
     )
 
 
-def _facility_mentions_24x7(record: Mapping) -> bool:
-    for f in ARRAY_FIELDS:
-        if any(_24X7.search(i) for i in parse_array(record.get(f))):
-            return True
-    return bool(_24X7.search(clean_str(record.get("description")) or ""))
+_KEYWORD_RX = {k: [re.compile(rf"(?<![a-z0-9]){re.escape(w)}(?![a-z0-9])")
+                   for w in sorted({a.lower() for a in sdef.query_aliases if len(a) >= 3})]
+               for k, sdef in TAXONOMY.items()}
 
 
-def keyword_hit(record: Mapping, service_key: str) -> bool:
-    """Naive baseline: any alias substring anywhere in any text field (incl. specialties), no negation handling."""
-    sdef = TAXONOMY[service_key]
-    blob = " ".join(
-        [" ".join(parse_array(record.get(f), dedupe=False)) for f in (*ARRAY_FIELDS, "specialties")]
-        + [clean_str(record.get(f)) or "" for f in STRING_FIELDS]
-    ).lower()
-    words = sorted({a.lower() for a in sdef.query_aliases if len(a) >= 3})
-    return any(re.search(rf"(?<![a-z0-9]){re.escape(w)}(?![a-z0-9])", blob) for w in words)
+EXACT_TERM = {"dialysis": "dialysis", "c_section": "c-section", "nicu": "nicu", "mri": "mri",
+              "cardiac_surgery": "cardiac surgery", "burn_care": "burn", "trauma_emergency": "trauma"}
+_EXACT_RX = {k: re.compile(rf"(?<![a-z0-9]){re.escape(t)}(?![a-z0-9])") for k, t in EXACT_TERM.items()}
+
+
+def exact_term_hit(record, service_key: str) -> bool:
+    """Baseline B2: the single canonical service word appears anywhere (no synonyms, no negation handling)."""
+    return bool(_EXACT_RX[service_key].search(parse_record(record).keyword_blob))
+
+
+def keyword_hit(record, service_key: str) -> bool:
+    """Naive baseline: any service alias as a whole word in any text field or specialty tag; no negation handling."""
+    blob = parse_record(record).keyword_blob
+    return any(rx.search(blob) for rx in _KEYWORD_RX[service_key])

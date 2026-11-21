@@ -59,8 +59,9 @@ In Databricks, open **Marketplace** and search for *Virtue Foundation* (the DAIS
 | 01 | `notebooks/01_data_audit` | read-only profiling and schema diff vs. the local CSV | 1–2 min |
 | 02 | `notebooks/02_build_silver` | writes `careproof_pincode_silver`, `careproof_nfhs_silver`, `careproof_facilities_silver`, `careproof_facilities_quarantine`, `careproof_join_report` | 2–4 min |
 | 03 | `notebooks/03_build_gold` | writes `careproof_facility_service_gold` | 1–3 min |
+| 03b | `notebooks/03b_exploratory_analysis` | question-driven EDA and data-quality analysis on the Marketplace data (read-only) | 1–2 min |
 | 04 | `notebooks/04_recommendation_demo` | **the interface**: widgets → result cards + tables + baseline comparison + NFHS context + guided scenarios | < 1 min |
-| 05 | `notebooks/05_evaluation` | benchmark, automatic metrics, labeling template | 1–2 min |
+| 05 | `notebooks/05_evaluation` | curated benchmark + seeded random sample; baselines B1–B4; latency p50/p95; blind labeling template | 2–4 min |
 
 Then, optionally, run [`sql/validation_queries.sql`](sql/validation_queries.sql) in the SQL editor.
 
@@ -111,9 +112,10 @@ Alternatively, run 02 and 03 with `rebuild_tables = yes`, which overwrites the t
 ```bash
 uv venv --python 3.12 .venv && source .venv/bin/activate   # or python3.12 -m venv .venv
 pip install -r requirements.txt
-python -m pytest -q tests                                  # 83 tests
+python -m pytest -q tests                                  # 91 tests
 # put the CSV exports in data/raw/ (see data/README.md), then:
-python scripts/run_local.py build                          # ~1.5 min
+python scripts/run_local.py build                          # ~1.5 min, writes Parquet to data/derived/
+python scripts/make_eda_report.py                          # regenerates docs/data_quality_report.md + figures
 python scripts/run_local.py query dialysis pincode 800001 25 5
 python scripts/run_local.py query "burn care" district "Koraput" 200 5
 python scripts/run_local.py query trauma coordinates 26.2183,78.1828 50 5
@@ -135,28 +137,39 @@ keyword baseline; benchmark with automatic metrics; HTML result cards.
 **Implemented, Databricks run pending:** notebooks 00–05 and the SQL validation queries. They were written against
 the local schema; notebook 01 reports any schema differences on Databricks.
 
-**Measured (local CSV run, 23 benchmark queries, default weights; to be re-measured on Databricks in notebook 05):**
+**Measured** (local CSV run; to be re-measured on Databricks in notebook 05). Headline numbers come from a
+**seeded, stratified random sample** of 56 queries (7 services × 4 district-rurality quartiles), frozen before
+results were inspected and split dev/test by state:
 
 | Metric | Value |
 |---|---|
-| Queries handled as expected (results, or the expected actionable error) | 22 / 23 |
-| Citation correctness (excerpt is an exact substring of the cited field) | 77 / 77 |
-| Geographic validity (within radius, inside India, distance recomputes) | 77 / 77 |
-| Baseline (nearest keyword match) results that are weak or contradictory | 30 / 80 |
-| Queries where the baseline's #1 is weak or contradictory | 9 / 18 |
-| Top-1 unchanged under alternative weight scenarios | 14–15 / 18 |
-| **Precision@K** | **PENDING HUMAN REVIEW** (labeling template generated) |
+| Citation correctness (excerpt is an exact substring of the cited field) | 187 / 187 |
+| Geographic validity (within radius, inside India, distance recomputes) | 187 / 187 |
+| Coverage (queries with ≥1 result) | 46 / 56; the 10 abstentions are mostly in rural quartiles |
+| CareProof top-1 differs from the nearest-synonym baseline | 29 / 56 |
+| Nearest-synonym baseline results that are tag-only, negated or contradicted | 57 / 188 |
+| Top-1 unchanged under 4 alternative weight policies | 47–52 / 56 |
+| Latency per query (warm, local) | p50 8.6 ms · p95 20.1 ms |
+| **Precision@K, NDCG@K, calibration** | **PENDING HUMAN REVIEW** (blind labeling template generated) |
 
-The one unmet expectation is Q12: there is no explicit burn-care text within 25 km of Mumbai GPO in this dataset.
-CareProof reports "none found" rather than promoting skin or cosmetic clinics. This is a dataset coverage gap,
-not a confirmed absence of burn care in Mumbai.
+These label-free numbers measure **evidence-policy compliance and behaviour, not correctness.** For example,
+CareProof's 100% explicit-evidence rate is true by construction. Correctness claims wait for human labels
+(see [`docs/labeling_rubric.md`](docs/labeling_rubric.md)). The 23-query curated benchmark tests edge-case
+behaviour (22/23 as expected). It is not an unbiased estimate.
 
-**Heuristic decisions (policy, not learned):** all weights, penalties, confidence thresholds, the 15 km PIN outlier
+Further documentation: [EDA / data-quality report](docs/data_quality_report.md) · [problem spec](docs/problem_spec.md) ·
+[literature review](docs/literature_review.md) · [decision log](docs/decision_log.md) · [system card](docs/system_card.md)
+
+**Heuristic decisions (policy, not learned):** all weights, penalties, confidence thresholds, the 15 km distance
+half-score, the 15 km PIN outlier
 radius, the 60% PIN inlier share, the 25 km location-conflict radius, and the field-strength values.
 
-**Proposed / not implemented:** a Databricks App front end, embedding- or LLM-based matching (deliberately
-deferred until after the deterministic baseline), road-network travel time, a district "evidence desert" planning
-view, and human-labelled precision@K.
+**Not trained, deliberately:** no supervised model. No independent labels exist, and labels derived from the same
+text would be target leakage ([problem spec](docs/problem_spec.md)).
+
+**Proposed / not implemented:** a Databricks App front end; embedding- or LLM-based claim verification; a
+travel-time surface (Weiss et al. 2020); a district "evidence desert" planning view; a learned re-ranker after
+human labels (state-grouped splits, calibration check).
 
 **What CareProof cannot guarantee:** that a service is currently available, staffed, affordable, or open;
 that web-extracted text is accurate or current; that coordinates are correct; or that distances reflect travel

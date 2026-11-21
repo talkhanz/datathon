@@ -22,6 +22,21 @@ def read_csv(name):
     return pd.read_csv(os.path.join(RAW, f"{name}.csv"), dtype=str, keep_default_na=False)
 
 
+def to_parquet(df, path):
+    """Parquet with object columns coerced to string/None (mixed bool/NaN columns break Arrow)."""
+    out = df.copy()
+    for c in out.columns:
+        if out[c].dtype == object:
+            nn = out[c].dropna()
+            if len(nn) and nn.map(lambda v: isinstance(v, bool)).all():
+                out[c] = out[c].map(lambda v: None if v is None or v != v else bool(v)).astype("boolean")
+            elif len(nn) and nn.map(lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)).all():
+                out[c] = pd.to_numeric(out[c], errors="coerce")
+            else:
+                out[c] = out[c].map(lambda v: None if v is None or (isinstance(v, float) and v != v) else str(v))
+    out.to_parquet(path, index=False)
+
+
 def build():
     os.makedirs(DER, exist_ok=True)
     t = time.time()
@@ -37,11 +52,11 @@ def build():
     print(gold.groupby(["service", "evidence_level"]).size().unstack(fill_value=0))
     for n, d in [("pincode_silver", pin), ("nfhs_silver", nfhs), ("facilities_silver", fac),
                  ("facilities_quarantine", quar), ("facility_service_gold", gold)]:
-        d.to_pickle(os.path.join(DER, f"careproof_{n}.pkl"))
+        to_parquet(d, os.path.join(DER, f"careproof_{n}.parquet"))
 
 
 def load(n):
-    return pd.read_pickle(os.path.join(DER, f"careproof_{n}.pkl"))
+    return pd.read_parquet(os.path.join(DER, f"careproof_{n}.parquet"))
 
 
 def query(service, ltype, lvalue, max_km=100, top_k=5):
@@ -79,18 +94,36 @@ if __name__ == "__main__":
 
 
 def evaluate():
-    from careproof.evaluation import run_benchmark, summarize
+    from careproof.evaluation import (compare_baselines, label_metrics, make_labeling_queries, run_benchmark,
+                                      summarize)
     pin, gold, silver = load("pincode_silver"), load("facility_service_gold"), load("facilities_silver")
     idx = P.place_index_from_pin_silver(pin)
+    pd.set_option("display.width", 250); pd.set_option("display.max_colwidth", 70); pd.set_option("display.max_columns", 20)
+    # (1) curated smoke benchmark: behaviour on hand-picked edge cases (NOT an unbiased estimate)
     q = pd.read_csv(os.path.join(ROOT, "evaluation", "benchmark_queries.csv"), dtype=str, keep_default_na=False)
     qdf, rdf, ldf = run_benchmark(q, gold, silver, idx)
-    pd.set_option("display.width", 250); pd.set_option("display.max_colwidth", 70)
     print(qdf[["query_id", "category", "service", "status", "n_results", "outcome_as_expected", "n_high", "n_low",
-               "baseline_top1_weak", "top1_differs_from_baseline", "message"]].to_string())
-    print(json.dumps(summarize(qdf), indent=1))
+               "baseline_top1_weak", "message"]].to_string())
+    print("CURATED BENCHMARK SUMMARY:", json.dumps(summarize(qdf), indent=1))
+    # (2) frozen, seeded, stratified random sample (the unbiased set for label-free metrics + human labels)
+    lq_path = os.path.join(ROOT, "evaluation", "labeling_queries_v1.csv")
+    if not os.path.exists(lq_path):
+        make_labeling_queries(pin, read_csv("india_post_pincode_directory")).to_csv(lq_path, index=False)
+        print("froze", lq_path)
+    lq = pd.read_csv(lq_path, dtype=str, keep_default_na=False)
+    for name, qs in (("CURATED", q), ("RANDOM_ALL", lq), ("RANDOM_DEV", lq[lq.split == "dev"]),
+                     ("RANDOM_TEST", lq[lq.split == "test"])):
+        agg, _ = compare_baselines(qs, gold, silver, idx)
+        print(f"\nBASELINE COMPARISON [{name}] ({len(qs)} queries)\n", agg.to_string(index=False))
+    lqdf, _, lldf = run_benchmark(lq, gold, silver, idx)
+    print("\nRANDOM SAMPLE status counts:", lqdf.status.value_counts().to_dict(),
+          "| zero-result queries by quartile:",
+          lqdf.assign(q=lqdf.category.str.split("|").str[1]).groupby("q").n_results.apply(lambda x: int((x == 0).sum())).to_dict())
+    print("RANDOM SAMPLE SUMMARY:", json.dumps(summarize(lqdf), indent=1))
     out = os.path.join(ROOT, "evaluation", "labeling_template_LOCAL.csv")
-    ldf.to_csv(out, index=False)
-    print("labeling template ->", out, len(ldf), "rows")
+    lldf.sample(frac=1, random_state=1).to_csv(out, index=False)
+    print("labeling template (shuffled, for blind review) ->", out, len(lldf), "rows")
+    print("label metrics:", label_metrics(lldf).to_dict("records"))
 
 
 if __name__ == "__main__" and sys.argv[1] == "eval":

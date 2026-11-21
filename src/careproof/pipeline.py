@@ -22,7 +22,7 @@ from .normalization import (
     parse_array, parse_nfhs_value, validate_coordinates,
 )
 from .scoring import location_quality_score, rank_key, score_candidate
-from .service_matching import TAXONOMY, keyword_hit, match_service
+from .service_matching import TAXONOMY, exact_term_hit, keyword_hit, match_service, parse_record
 
 ORIGINAL_FACILITY_COLUMNS_REQUIRED = [
     "unique_id", "name", "description", "source_urls", "specialties", "procedure", "equipment", "capability",
@@ -316,15 +316,17 @@ def build_facility_service_gold(silver: pd.DataFrame, services=None) -> pd.DataF
     for r in silver.to_dict("records"):
         base = {k: r.get(k) for k in GOLD_CARRY}
         fflags = json.loads(r["facility_flags_json"])
+        parsed = parse_record(r)  # parse JSON text fields once, reuse for all services
         for s in services:
-            m = match_service(r, s)
-            kw = keyword_hit(r, s)
-            if m.evidence_level == "none" and not kw:
+            m = match_service(parsed, s)
+            kw = keyword_hit(parsed, s)
+            ex = exact_term_hit(parsed, s)
+            if m.evidence_level == "none" and not kw and not ex:
                 continue
             all_flags = sorted(set(fflags) | set(m.conflicts))
             recs.append({
                 **base, "service": s, "evidence_level": m.evidence_level, "is_candidate": m.is_candidate,
-                "baseline_keyword_hit": kw,
+                "baseline_keyword_hit": kw, "baseline_exact_term_hit": ex,
                 "service_match_score": m.service_match_score,
                 "evidence_confidence_score": m.evidence_confidence_score,
                 "readiness_score": m.readiness_score,
@@ -371,7 +373,7 @@ def recommend(gold: pd.DataFrame, loc: ResolvedLocation, service_key: str, max_d
     results = []
     for r in cands.to_dict("records"):
         flags = json.loads(r["flags_json"])
-        sc = score_candidate({**r, "flags": flags}, r["distance_km"], max_distance_km, weights)
+        sc = score_candidate({**r, "flags": flags}, r["distance_km"], weights)
         missing, contra = warnings_for(flags, json.loads(r["missing_corroboration_json"]))
         neg = json.loads(r["negated_excerpts_json"])
         if neg:
@@ -381,6 +383,8 @@ def recommend(gold: pd.DataFrame, loc: ResolvedLocation, service_key: str, max_d
             "address": ", ".join(x for x in [clean_str(r["address_line1"]), clean_str(r["address_city"]),
                                              clean_str(r["address_stateOrRegion"]), clean_str(r["address_zipOrPostcode"])] if x),
             "distance_km": round(float(r["distance_km"]), 2), "location_source": r["location_source"],
+            "location_lat": float(r["location_lat"]), "location_lon": float(r["location_lon"]),
+            "name_norm": normalize_name(r["name"]),
             **sc,
             "matched_fields": json.loads(r["matched_fields_json"]), "matched_terms": json.loads(r["matched_terms_json"]),
             "specialty_tags": json.loads(r["specialty_tags_json"]),
@@ -391,7 +395,10 @@ def recommend(gold: pd.DataFrame, loc: ResolvedLocation, service_key: str, max_d
             "verification_warning": VERIFICATION_WARNING,
         })
     results.sort(key=rank_key)
+    results = collapse_duplicates(results)
+    n_ranked = len(results)
     results = results[:top_k]
+    summary["status"] = abstention_status(results, n_ranked)
     for i, r in enumerate(results, 1):
         r["rank"] = i
         r["explanation"] = explain(r, sdef.label)
@@ -399,19 +406,60 @@ def recommend(gold: pd.DataFrame, loc: ResolvedLocation, service_key: str, max_d
     return results, summary
 
 
+def collapse_duplicates(ranked, radius_km: float = 1.0):
+    """Keep the best-ranked of records with the same normalized name within ``radius_km``; note the others."""
+    kept = []
+    for r in ranked:
+        twin = next((k for k in kept if r["name_norm"] and k["name_norm"] == r["name_norm"] and
+                     haversine_km(k["location_lat"], k["location_lon"], r["location_lat"], r["location_lon"]) <= radius_km),
+                    None)
+        if twin is None:
+            r.setdefault("duplicate_records_collapsed", [])
+            kept.append(r)
+        else:
+            twin["duplicate_records_collapsed"].append(r["facility_id"])
+            msg = (f"A near-identical record ({r['facility_id']}) was merged into this result; the listing may be "
+                   "duplicated in the source data.")
+            if msg not in twin["missing_data_warnings"]:
+                twin["missing_data_warnings"].append(msg)
+    return kept
+
+
+ABSTAIN_NO_EVIDENCE = "abstain_no_explicit_evidence_in_radius"
+LOW_CONFIDENCE_ONLY = "answered_low_confidence_only"
+ANSWERED = "answered"
+
+
+def abstention_status(results, n_ranked) -> str:
+    """Explicit abstention semantics (see docs/system_card.md)."""
+    if not results:
+        return ABSTAIN_NO_EVIDENCE
+    if all(r["confidence"] == "Low" for r in results):
+        return LOW_CONFIDENCE_ONLY
+    return ANSWERED
+
+
 def validate_recommendations(results):
     for r in results:
         if not (r.get("evidence_excerpt") or "").strip():
             raise AssertionError(f"Recommendation {r['facility_id']} has no evidence excerpt")
+        if not r.get("evidence_field"):
+            raise AssertionError(f"Recommendation {r['facility_id']} has no evidence field (provenance)")
+    ids = [r["facility_id"] for r in results]
+    if len(ids) != len(set(ids)):
+        raise AssertionError("Duplicate facility_id in recommendations")
+    for r in results:
         for k in ("service_match_score", "evidence_confidence_score", "location_quality_score", "distance_score",
                   "readiness_score", "final_score", "data_quality_penalty"):
             if not 0.0 <= r[k] <= 1.0:
                 raise AssertionError(f"{k}={r[k]} out of [0,1] for {r['facility_id']}")
 
 
-def keyword_baseline(gold: pd.DataFrame, loc: ResolvedLocation, service_key: str, max_distance_km: float, top_k: int):
-    """'Nearest facility with a keyword match' - the naive comparison baseline."""
-    g = gold[(gold["service"] == service_key) & gold["baseline_keyword_hit"] & gold["location_lat"].notna()].copy()
+def keyword_baseline(gold: pd.DataFrame, loc: ResolvedLocation, service_key: str, max_distance_km: float, top_k: int,
+                     column: str = "baseline_keyword_hit"):
+    """Nearest facility whose text matches the service (B3 synonyms: baseline_keyword_hit; B2 exact word:
+    baseline_exact_term_hit). Distance only; no negation, no contradiction checks."""
+    g = gold[(gold["service"] == service_key) & gold[column].astype(bool) & gold["location_lat"].notna()].copy()
     g["distance_km"] = _haversine_vec(loc.lat, loc.lon, g["location_lat"].values, g["location_lon"].values)
     g = g[g["distance_km"] <= max_distance_km].sort_values(["distance_km", "facility_id"]).head(top_k)
     return [{"rank": i, "facility_id": r["facility_id"], "facility_name": r["name"],
@@ -428,3 +476,12 @@ def nfhs_context(nfhs: pd.DataFrame, district: Optional[str], state: Optional[st
     if state:
         m = m[m["state_norm"] == state]
     return m[["district_name_raw", "state_ut_raw", "indicator", "raw_value", "value", "is_suppressed", "is_small_sample"]]
+
+
+def nearest_any_baseline(silver: pd.DataFrame, loc: ResolvedLocation, max_distance_km: float, top_k: int):
+    """B1: nearest facility of any kind, ignoring the requested service."""
+    g = silver[silver["location_lat"].notna()][["facility_id", "name", "location_lat", "location_lon"]].copy()
+    g["distance_km"] = _haversine_vec(loc.lat, loc.lon, g["location_lat"].values, g["location_lon"].values)
+    g = g[g["distance_km"] <= max_distance_km].sort_values(["distance_km", "facility_id"]).head(top_k)
+    return [{"rank": i, "facility_id": r["facility_id"], "facility_name": r["name"],
+             "distance_km": round(float(r["distance_km"]), 2)} for i, r in enumerate(g.to_dict("records"), 1)]

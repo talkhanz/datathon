@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Iterable, Mapping, Optional
 
 from .config import (
-    CONFIDENCE_RULES, DEFAULT_WEIGHTS, LOCATION_AGREE_KM, LOCATION_CONFLICT_KM, MAX_TOTAL_PENALTY, PENALTIES,
+    CONFIDENCE_RULES, DEFAULT_WEIGHTS, DISTANCE_HALF_SCORE_KM, LOCATION_AGREE_KM, LOCATION_CONFLICT_KM, MAX_TOTAL_PENALTY, PENALTIES,
     ScoringWeights,
 )
 
@@ -25,11 +25,14 @@ def clamp01(x: Optional[float]) -> float:
     return max(0.0, min(1.0, float(x)))
 
 
-def distance_score(distance_km: Optional[float], max_distance_km: float) -> float:
-    """Linear decay: 1 at the query point, 0 at max_distance_km. None -> 0."""
-    if distance_km is None or max_distance_km <= 0:
+def distance_score(distance_km: Optional[float], half_score_km: float = DISTANCE_HALF_SCORE_KM) -> float:
+    """Hyperbolic distance decay: 1 at 0 km, 0.5 at ``half_score_km``, never negative.
+
+    Independent of the search radius, so the radius filters candidates without reordering them.
+    """
+    if distance_km is None or distance_km != distance_km or half_score_km <= 0:
         return 0.0
-    return clamp01(1.0 - distance_km / max_distance_km)
+    return clamp01(1.0 / (1.0 + max(0.0, float(distance_km)) / half_score_km))
 
 
 def location_quality_score(source: str, pin_distance_km: Optional[float], state_conflict: bool) -> float:
@@ -84,13 +87,12 @@ def rank_key(r: Mapping):
     return (-round(r["final_score"], 6), d if d is not None else float("inf"), str(r["facility_id"]))
 
 
-def score_candidate(cand: Mapping, distance_km: float, max_distance_km: float,
-                    weights: ScoringWeights = DEFAULT_WEIGHTS) -> dict:
+def score_candidate(cand: Mapping, distance_km: float, weights: ScoringWeights = DEFAULT_WEIGHTS) -> dict:
     comps = {
         "service_match_score": clamp01(cand["service_match_score"]),
         "evidence_confidence_score": clamp01(cand["evidence_confidence_score"]),
         "location_quality_score": clamp01(cand["location_quality_score"]),
-        "distance_score": round(distance_score(distance_km, max_distance_km), 4),
+        "distance_score": round(distance_score(distance_km), 4),
         "readiness_score": clamp01(cand["readiness_score"]),
     }
     flags = list(cand.get("flags") or [])

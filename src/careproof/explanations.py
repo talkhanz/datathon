@@ -81,6 +81,14 @@ def render_cards_html(results, summary, title: str = "") -> str:
         f"within {summary['max_distance_km']:.0f} km · {summary['explicit_text_candidates_in_radius']} facilities "
         f"with explicit text evidence · {summary['specialty_tag_only_excluded']} more only list a related specialty "
         f"tag and are <i>not</i> recommended · {summary['negated_only_excluded']} excluded for negated/planned mentions.</p>")
+    status = summary.get("status")
+    if status == "answered_low_confidence_only":
+        out.append("<div style='background:#ffebe9;padding:6px 10px;border-radius:6px;margin:4px 0'><b>Low confidence "
+                   "only.</b> Every facility found here has weak or contradictory evidence. Treat these as leads to "
+                   "verify, not recommendations, or widen the search.</div>")
+    elif status == "abstain_no_explicit_evidence_in_radius":
+        out.append("<div style='background:#fff8c5;padding:6px 10px;border-radius:6px;margin:4px 0'><b>CareProof "
+                   "abstains:</b> no facility in this radius states the service in its own text.</div>")
     for w in summary.get("location_warnings") or []:
         out.append(f"<div style='background:#fff8c5;padding:6px 10px;border-radius:6px;margin:4px 0'>📍 {e(w)}</div>")
     out.append(f"<div style='background:#ffebe9;padding:8px 10px;border-radius:6px;margin:8px 0'><b>⚠ Verify before "

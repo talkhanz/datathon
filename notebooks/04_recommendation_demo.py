@@ -47,7 +47,7 @@ def gold_for(service_key):
         for c in ("location_lat", "location_lon", "location_quality_score", "service_match_score",
                   "evidence_confidence_score", "readiness_score", "facility_to_pin_km"):
             g[c] = pd.to_numeric(g[c], errors="coerce")
-        for c in ("is_candidate", "baseline_keyword_hit"):
+        for c in ("is_candidate", "baseline_keyword_hit", "baseline_exact_term_hit"):
             g[c] = g[c] == "true"
         _GOLD_CACHE[service_key] = g
     return _GOLD_CACHE[service_key]

@@ -71,6 +71,10 @@ PIN_MIN_INLIER_SHARE = 0.6     # centroid is "defensible" only if >= 60% of geoc
 LOCATION_AGREE_KM = 5.0        # facility coords within this of its PIN centroid = strong agreement
 LOCATION_CONFLICT_KM = 25.0    # facility coords farther than this from its PIN centroid = conflict
 DEFAULT_MAX_DISTANCE_KM = 100.0
+# Distance decay (policy): distance_score = 1 / (1 + d / DISTANCE_HALF_SCORE_KM), i.e. 0.5 at this distance.
+# It is deliberately independent of the user's search radius, so changing max_distance_km only filters
+# candidates and never reorders the facilities that remain (verified by tests/test_scoring.py).
+DISTANCE_HALF_SCORE_KM = 15.0
 DEFAULT_TOP_K = 5
 
 

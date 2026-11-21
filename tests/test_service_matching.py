@@ -91,3 +91,19 @@ def test_baseline_keyword_is_naive():
     r = rec(capability='["MRI not available"]')
     assert keyword_hit(r, "mri")  # baseline counts the negated mention
     assert not keyword_hit(rec(name="Amritaa Diagnostics"), "mri")  # word boundaries, not substrings
+
+
+def test_parsed_record_path_equals_reference_path():
+    """Optimised (parse once, reuse) path must give identical results to the raw-mapping path."""
+    from careproof.service_matching import TAXONOMY, parse_record
+    records = [
+        rec(name="Aravind Eye Hospital", procedure='["Dialysis unit with 10 machines 24x7"]', specialties='["nephrology"]'),
+        rec(description="Emergency department open 24 hours. MRI not available.", capability='["Casualty"]'),
+        rec(procedure='["Gastric Bypass Surgery","CABG"]', equipment='["1.5T MRI scanner"]'),
+        rec(capability='["300-bed trauma care hospital under construction","Burn unit"]'),
+    ]
+    for r in records:
+        p = parse_record(r)
+        for s in TAXONOMY:
+            assert match_service(r, s) == match_service(p, s)
+            assert keyword_hit(r, s) == keyword_hit(p, s)

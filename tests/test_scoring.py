@@ -12,15 +12,16 @@ GOOD = {"service_match_score": 1.0, "evidence_confidence_score": 0.9, "location_
 def test_score_bounds_extremes():
     for comps in [dict.fromkeys(GOOD, 0.0), {**GOOD, "service_match_score": 5, "readiness_score": -3}]:
         s = score_candidate({**comps, "flags": ["negated_mention", "specialty_mismatch", "location_conflict",
-                                                "state_conflict", "suspicious_source_url"]}, 0.0, 50)
+                                                "state_conflict", "suspicious_source_url"]}, 0.0)
         for k, v in s.items():
             if k != "confidence":
                 assert 0.0 <= v <= 1.0, k
 
 
 def test_distance_score():
-    assert distance_score(0, 100) == 1.0 and distance_score(50, 100) == 0.5
-    assert distance_score(150, 100) == 0.0 and distance_score(None, 100) == 0.0
+    assert distance_score(0) == 1.0 and distance_score(15) == 0.5 and distance_score(45) == 0.25
+    assert distance_score(None) == 0.0 and 0 < distance_score(5000) < 0.01
+    assert distance_score(10) > distance_score(11)  # strictly decreasing
 
 
 def test_penalty_application_and_cap():
@@ -28,8 +29,8 @@ def test_penalty_application_and_cap():
     assert data_quality_penalty(["specialty_mismatch"]) == PENALTIES["specialty_mismatch"]
     assert data_quality_penalty(["specialty_mismatch", "specialty_mismatch"]) == PENALTIES["specialty_mismatch"]
     assert data_quality_penalty(list(PENALTIES)) == MAX_TOTAL_PENALTY
-    clean = score_candidate(GOOD, 5, 50)
-    bad = score_candidate({**GOOD, "flags": ["specialty_mismatch"]}, 5, 50)
+    clean = score_candidate(GOOD, 5)
+    bad = score_candidate({**GOOD, "flags": ["specialty_mismatch"]}, 5)
     assert bad["final_score"] == pytest.approx(clean["final_score"] - PENALTIES["specialty_mismatch"], abs=1e-4)
     assert bad["confidence"] != "High"
 

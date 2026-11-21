@@ -1,0 +1,108 @@
+"""End-to-end tests on a tiny synthetic dataset: silver -> gold -> recommend (same path as Databricks)."""
+import json
+
+import pandas as pd
+import pytest
+
+from careproof import pipeline as P
+from careproof.geography import ResolvedLocation
+from careproof.service_matching import count_distinct_statements
+
+COLS = ["unique_id", "name", "description", "source_urls", "specialties", "procedure", "equipment", "capability",
+        "address_line1", "address_city", "address_stateOrRegion", "address_zipOrPostcode", "latitude", "longitude",
+        "facilityTypeId", "officialWebsite", "websites"]
+
+
+def fac(i, name, lat, lon, procedure="null", pin="800001", description="General hospital.", specialties="null",
+        capability="null"):
+    return {"unique_id": f"00000000-0000-0000-0000-{i:012d}", "name": name, "description": description,
+            "source_urls": '["https://example.org/a"]', "specialties": specialties, "procedure": procedure,
+            "equipment": "null", "capability": capability, "address_line1": "Road", "address_city": "Patna",
+            "address_stateOrRegion": "Bihar", "address_zipOrPostcode": pin, "latitude": str(lat),
+            "longitude": str(lon), "facilityTypeId": "hospital", "officialWebsite": "null", "websites": "[]"}
+
+
+@pytest.fixture(scope="module")
+def built():
+    pins = pd.DataFrame([{"circlename": "", "regionname": "", "divisionname": "", "officename": f"O{i}",
+                          "pincode": "800001", "officetype": "PO", "delivery": "Delivery", "district": "PATNA",
+                          "statename": "BIHAR", "latitude": str(25.61 + i * 0.001), "longitude": "85.14"}
+                         for i in range(5)])
+    pin_silver = P.build_pincode_silver(pins)
+    rows = [
+        fac(1, "Near Weak Clinic", 25.612, 85.141, procedure='["Dialysis"]'),
+        fac(2, "Far Strong Dialysis Centre", 25.70, 85.20, procedure='["Haemodialysis unit with 10 machines, 24x7"]',
+            description="Dedicated dialysis centre offering haemodialysis.", specialties='["nephrology"]'),
+        fac(3, "Twin Hospital", 25.62, 85.15, procedure='["Dialysis unit"]'),
+        fac(4, "Twin Hospital", 25.6205, 85.1505, procedure='["Dialysis services"]'),
+        fac(5, "Mid Hospital", 25.65, 85.17, capability='["Dialysis available"]', procedure='["Dialysis"]'),
+        fac(6, "Negated Hospital", 25.611, 85.140, capability='["Dialysis not available"]'),
+        fac(7, "Tag Only Hospital", 25.613, 85.142, specialties='["nephrology"]'),
+        {**fac(8, "Broken", 0, 0), "unique_id": "| **fragment**"},
+    ]
+    raw = pd.DataFrame(rows)[COLS]
+    silver, quarantine, rep = P.build_facility_silver(raw, pin_silver)
+    gold = P.build_facility_service_gold(silver, ["dialysis"])
+    return silver, quarantine, gold
+
+
+LOC = ResolvedLocation(25.61, 85.14, "test", "user_coordinates")
+
+
+def test_quarantine_and_gold_levels(built):
+    silver, quarantine, gold = built
+    assert len(quarantine) == 1 and len(silver) == 7
+    lv = dict(zip(gold["name"] + "|" + gold["facility_id"].str[-1], gold["evidence_level"]))
+    assert lv["Negated Hospital|6"] == "negated_only" and lv["Tag Only Hospital|7"] == "specialty_tag_only"
+
+
+def test_radius_only_filters_never_reorders(built):
+    _, _, gold = built
+    small, _ = P.recommend(gold, LOC, "dialysis", 5, 50)
+    large, _ = P.recommend(gold, LOC, "dialysis", 100, 50)
+    small_ids = [r["facility_id"] for r in small]
+    large_within = [r["facility_id"] for r in large if r["distance_km"] <= 5]
+    assert small_ids == large_within
+    for a in small:
+        b = next(x for x in large if x["facility_id"] == a["facility_id"])
+        assert a["final_score"] == b["final_score"]
+
+
+def test_excluded_levels_and_abstention(built):
+    _, _, gold = built
+    res, summ = P.recommend(gold, LOC, "dialysis", 100, 10)
+    names = {r["facility_name"] for r in res}
+    assert "Negated Hospital" not in names and "Tag Only Hospital" not in names
+    assert summ["status"] in (P.ANSWERED, P.LOW_CONFIDENCE_ONLY)
+    none, summ2 = P.recommend(gold, ResolvedLocation(20.0, 80.0, "far", "user_coordinates"), "dialysis", 10, 5)
+    assert none == [] and summ2["status"] == P.ABSTAIN_NO_EVIDENCE
+
+
+def test_duplicates_collapsed(built):
+    _, _, gold = built
+    res, _ = P.recommend(gold, LOC, "dialysis", 100, 10)
+    twins = [r for r in res if r["facility_name"] == "Twin Hospital"]
+    assert len(twins) == 1 and len(twins[0]["duplicate_records_collapsed"]) == 1
+    assert any("near-identical record" in w for w in twins[0]["missing_data_warnings"])
+
+
+def test_every_result_cites_exact_text(built):
+    silver, _, gold = built
+    by_id = silver.set_index("facility_id").to_dict("index")
+    from careproof.evaluation import excerpt_is_exact
+    res, _ = P.recommend(gold, LOC, "dialysis", 100, 10)
+    assert res and all(excerpt_is_exact(by_id[r["facility_id"]], r["evidence_field"], r["evidence_excerpt"]) for r in res)
+
+
+def test_ranking_deterministic(built):
+    _, _, gold = built
+    a, _ = P.recommend(gold, LOC, "dialysis", 100, 10)
+    b, _ = P.recommend(gold.sample(frac=1, random_state=7), LOC, "dialysis", 100, 10)
+    assert [r["facility_id"] for r in a] == [r["facility_id"] for r in b]
+
+
+def test_distinct_statements():
+    assert count_distinct_statements(["NICU", "NICU.", "Neonatal unit"]) == 2
+    assert count_distinct_statements(["Neonatal Intensive Care Unit (NICU)",
+                                      "Neonatal Intensive Care Unit (NICU) with incubators"]) == 1
+    assert count_distinct_statements([]) == 0
