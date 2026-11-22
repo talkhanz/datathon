@@ -35,7 +35,19 @@ TABLES = {
     "facility_service_gold": "careproof_facility_service_gold",
     "join_report": "careproof_join_report",
     "eval_results": "careproof_eval_results",
+    # supervised service-profile model + GA (notebook 07 / scripts/run_local.py model)
+    "model_scores": "careproof_model_scores",
+    "model_feature_selection": "careproof_model_feature_selection",
+    "model_metrics": "careproof_model_metrics",
+    "model_ga_history": "careproof_model_ga_history",
+    "model_optimal_profile": "careproof_model_optimal_profile",
+    "model_profile_summary": "careproof_model_profile_summary",
+    "model_calibration": "careproof_model_calibration",
+    "model_features": "careproof_model_features",
+    "model_facilities": "careproof_model_facilities",
 }
+MODEL_TABLES = ("model_scores", "model_feature_selection", "model_metrics", "model_ga_history", "model_optimal_profile",
+                "model_profile_summary", "model_calibration", "model_features", "model_facilities")
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 

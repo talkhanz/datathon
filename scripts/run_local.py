@@ -4,6 +4,7 @@ Usage:
     python scripts/run_local.py build                      # build silver + gold into data/derived/
     python scripts/run_local.py query dialysis pincode 800001 [max_km] [top_k]
     python scripts/run_local.py query mri coordinates 28.6139,77.2090
+    python scripts/run_local.py model                      # train service-profile models + GA (after build)
 """
 import json, os, sys, time
 import pandas as pd
@@ -92,9 +93,24 @@ def query(service, ltype, lvalue, max_km=100, top_k=5):
         print("  ", b)
 
 
+def model():
+    from careproof import modeling as M
+    t = time.time()
+    out = M.train_all(load("facilities_silver"), load("facility_service_gold"))
+    for name, df in out.items():
+        to_parquet(df, os.path.join(DER, f"careproof_{name}.parquet"))
+    m = out["model_metrics"]
+    pd.set_option("display.width", 250)
+    print(m[m.split == "test"].pivot_table(index="service", columns=["model", "feature_set"], values="average_precision").round(3))
+    print(out["model_profile_summary"][["service", "model", "feature_set", "n_features", "test_average_precision",
+                                        "test_base_rate", "profile_score", "nearest_real_facility_name"]].to_string())
+    print(f"model tables written ({time.time()-t:.0f}s)")
+
+
 if __name__ == "__main__":
-    if sys.argv[1] == "eval":
-        pass
+    if sys.argv[1] in ("eval", "model"):
+        if sys.argv[1] == "model":
+            model()
     elif sys.argv[1] == "build":
         build()
     else:

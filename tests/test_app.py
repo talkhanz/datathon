@@ -54,3 +54,24 @@ def test_call_and_refer_flow_promotes_alternative():
     assert not at.exception
     assert "Next option" in text(at)
     assert "CAREPROOF REFERRAL SUMMARY" in " ".join(c.value for c in at.code)
+
+
+def test_model_tab_and_profile_fit_render():
+    if not os.path.exists(os.path.join(DATA, "careproof_model_scores.parquet")):
+        pytest.skip("model tables not built")
+    at = search()
+    assert not at.exception
+    t = text(at)
+    assert "Profile fit (model)" in t                      # card bar from the service-profile model
+    assert "GA optimal profile" in t or "optimal provider profile" in t
+    assert any(m.label.startswith("Avg. precision") for m in at.metric)
+
+
+def test_capacity_planner_runs():
+    if not os.path.exists(os.path.join(DATA, "careproof_model_facilities.parquet")):
+        pytest.skip("model tables not built")
+    at = search()
+    next(b for b in at.button if b.label == "Optimise").click().run()
+    assert not at.exception
+    labels = [m.label for m in at.metric]
+    assert "Demand within reach" in labels and "Districts with no access" in labels
