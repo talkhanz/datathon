@@ -5,6 +5,7 @@ Usage:
     python scripts/run_local.py query dialysis pincode 800001 [max_km] [top_k]
     python scripts/run_local.py query mri coordinates 28.6139,77.2090
     python scripts/run_local.py model                      # train service-profile models + GA (after build)
+    python scripts/run_local.py external                   # PM-JAY external check (after scripts/fetch_external.py)
 """
 import json, os, sys, time
 import pandas as pd
@@ -107,10 +108,25 @@ def model():
     print(f"model tables written ({time.time()-t:.0f}s)")
 
 
+def external():
+    """Independent check against official PM-JAY empanelment lists (run scripts/fetch_external.py first)."""
+    from careproof import external as E
+    ref = pd.read_parquet(os.path.join(ROOT, "data", "external", "careproof_ext_pmjay_hospitals.parquet"))
+    out = E.run(ref, load("facilities_silver"), load("facility_service_gold"), load("model_scores"))
+    print("matches:", out["match_summary"])
+    for k in ("external_matches", "external_validation", "external_validation_detail"):
+        to_parquet(out[k], os.path.join(DER, f"careproof_{k}.parquet"))
+    v = out["external_validation"]
+    pd.set_option("display.width", 250)
+    print(v[["service", "system", "n_flagged", "empanelled_rate", "ci95_low", "ci95_high", "base_rate"]].round(2).to_string())
+
+
 if __name__ == "__main__":
-    if sys.argv[1] in ("eval", "model"):
+    if sys.argv[1] in ("eval", "model", "external"):
         if sys.argv[1] == "model":
             model()
+        elif sys.argv[1] == "external":
+            external()
     elif sys.argv[1] == "build":
         build()
     else:

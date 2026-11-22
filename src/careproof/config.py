@@ -45,7 +45,13 @@ TABLES = {
     "model_calibration": "careproof_model_calibration",
     "model_features": "careproof_model_features",
     "model_facilities": "careproof_model_facilities",
+    # independent reference data (notebook 08 / scripts/run_local.py external)
+    "external_reference": "careproof_ext_pmjay_hospitals",
+    "external_matches": "careproof_external_matches",
+    "external_validation": "careproof_external_validation",
+    "external_validation_detail": "careproof_external_validation_detail",
 }
+EXTERNAL_TABLES = ("external_matches", "external_validation", "external_validation_detail")
 MODEL_TABLES = ("model_scores", "model_feature_selection", "model_metrics", "model_ga_history", "model_optimal_profile",
                 "model_profile_summary", "model_calibration", "model_features", "model_facilities")
 

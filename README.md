@@ -61,6 +61,7 @@ In Databricks, open **Marketplace** and search for *Virtue Foundation* (the DAIS
 | app | **CareProof Referral Navigator** (Databricks App, `app/app.py`) | Find · Compare · Verify · Refer, the main user interface; plus a GA **capacity planner** ([docs](docs/capacity_planner.md)) and a model & GA insights tab (need notebook 07) | see below |
 | 05 | `notebooks/05_evaluation` | curated benchmark + seeded random sample; baselines B1–B4; latency p50/p95; blind labeling template | 2–4 min |
 | 06 | `notebooks/06_policy_optimization` | KPI-driven ranking-weight optimisation (Bayesian TPE + NSGA-II) under hard safety constraints | 3–6 min |
+| 08 | `notebooks/08_external_validation` | **independent check** against official Ayushman Bharat PM-JAY empanelment lists (Haryana State Health Agency): support rates per system with 95% CIs ([docs](docs/external_validation.md)); needs `scripts/fetch_external.py` output uploaded to the `careproof_external` volume | 1–2 min |
 | 07 | `notebooks/07_service_profile_model` | service-profile model: filter + **genetic-algorithm feature selection**, logistic vs boosted trees vs tag rule on held-out states, **GA optimal-profile** inverse design → `careproof_model_*` tables used by the app ([docs](docs/service_profile_model.md)) | 5–8 min |
 
 Then, optionally, run [`sql/validation_queries.sql`](sql/validation_queries.sql) in the SQL editor.
@@ -127,7 +128,7 @@ Alternatively, run 02 and 03 with `rebuild_tables = yes`, which overwrites the t
 ```bash
 uv venv --python 3.12 .venv && source .venv/bin/activate   # or python3.12 -m venv .venv
 pip install -r requirements.txt
-python -m pytest -q tests                                  # 163 tests (incl. headless Streamlit app tests)
+python -m pytest -q tests                                  # 173 tests (incl. headless Streamlit app tests)
 # put the CSV exports in data/raw/ (see data/README.md), then:
 python scripts/run_local.py build                          # ~1.5 min, writes Parquet to data/derived/
 python scripts/make_eda_report.py                          # regenerates docs/data_quality_report.md + figures
@@ -136,6 +137,7 @@ python scripts/run_local.py query "burn care" district "Koraput" 200 5
 python scripts/run_local.py query trauma coordinates 26.2183,78.1828 50 5
 python scripts/run_local.py eval
 python scripts/run_local.py model                          # ~5 min: feature selection, training, GA profiles
+python scripts/fetch_external.py && python scripts/run_local.py external   # official PM-JAY lists -> external check
 ```
 
 ---

@@ -29,3 +29,6 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+data/external/*
+!data/external/README.md
+!evaluation/external_sources_v1.csv

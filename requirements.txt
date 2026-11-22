@@ -9,3 +9,4 @@ databricks-sdk>=0.30
 pytest>=7.0
 
 scikit-learn>=1.3   # model training (notebook 07 / run_local.py model); the app itself only reads results
+pdfplumber>=0.11   # parse official PM-JAY PDFs (scripts/fetch_external.py only)

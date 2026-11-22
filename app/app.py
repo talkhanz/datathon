@@ -27,6 +27,7 @@ from careproof.config import DEFAULT_WEIGHTS, TABLES, VERIFICATION_WARNING, fq_t
 from careproof.explanations import COMPONENT_NAMES, gate_reason_short, short_reasons  # noqa: E402
 from careproof.geography import LocationError, resolve_free_text  # noqa: E402
 from careproof import coverage as CV  # noqa: E402
+from careproof.external import SPECIALTY_MAP  # noqa: E402
 from careproof.modeling import LOG_FEATURES, unverified_leads  # noqa: E402
 from careproof.referral import (BLOCKING_STATUSES, STATUSES, checklist, next_alternative,  # noqa: E402
                                 referral_summary)
@@ -144,6 +145,15 @@ def load_model():
     return t
 
 
+@st.cache_resource(show_spinner=False)
+def load_external():
+    t = _read_tables(list(config.EXTERNAL_TABLES))
+    if t.get("external_matches") is None:
+        return None
+    t["by_facility"] = t["external_matches"].drop_duplicates("facility_id").set_index("facility_id")
+    return t
+
+
 def gold_row(gold, fid, svc):
     m = gold[(gold.facility_id == fid) & (gold.service == svc)]
     return None if m.empty else m.iloc[0]
@@ -163,6 +173,30 @@ try:
     MODEL = load_model()
 except Exception:  # pragma: no cover - model tables are optional
     MODEL = None
+try:
+    EXT = load_external()
+except Exception:  # pragma: no cover
+    EXT = None
+
+
+def external_badge(fid, svc):
+    """Independent corroboration from official PM-JAY empanelment lists (display only; never changes ranking)."""
+    if EXT is None or fid not in EXT["by_facility"].index:
+        return None, None
+    r = EXT["by_facility"].loc[fid]
+    warn = None
+    if isinstance(r.get("adverse_status"), str):
+        warn = (f"PM-JAY status **{r['adverse_status'].replace('_', '-')}** (Haryana SHA list, {r['adverse_status_date']}). "
+                "Confirm admission and payment arrangements before referring.")
+    flag = r.get(f"empanelled_{svc}")
+    if svc in SPECIALTY_MAP and str(r.get("has_specialities")).lower() == "true":
+        spec = SPECIALTY_MAP[svc][1].split(": ", 1)[-1]
+        if str(flag).lower() == "true":
+            return (f"🏛️ **Independently corroborated:** empanelled under Ayushman Bharat PM-JAY for {spec} "
+                    f"(Haryana State Health Agency list, {r['specialities_list_date']})."), warn
+        return (f"🏛️ On the PM-JAY empanelment list ({r['specialities_list_date']}), but not for {spec}. "
+                "Not proof either way: hospitals need not empanel every service."), warn
+    return "🏛️ On the current PM-JAY empanelled list (no speciality breakdown published for this district).", warn
 
 
 def model_fit(fid, svc):
@@ -329,6 +363,11 @@ with tab_find:
                     b.markdown(f"{pill(EV_LABEL.get(cat, cat), EV_COLOR.get(cat, '#6e7781'))}<br>"
                                f"<span style='font-size:.85rem'>{esc(status_txt)}</span>", unsafe_allow_html=True)
                     st.markdown(f"> “{md(clip(r['evidence_excerpt']))}”")
+                    ext_txt, ext_warn = external_badge(r["facility_id"], q["svc"])
+                    if ext_txt:
+                        st.caption(ext_txt)
+                    if ext_warn:
+                        st.warning(ext_warn, icon="⚠️")
                     m1, m2, m3 = st.columns(3)
                     m1.markdown(bar("Evidence", EV_LEVEL.get(cat, 0), EV_COLOR.get(cat, "#6e7781"), cat),
                                 unsafe_allow_html=True)
@@ -698,6 +737,37 @@ with tab_model:
         st.caption(f"Closest real documented facility to the optimal profile: **{md(summ_m.nearest_real_facility_name)}**. "
                    "The profile describes what the model associates with documented service. It is **not** a causal "
                    "recipe: adding a tag does not create a dialysis unit.")
+
+        if EXT is not None and EXT.get("external_validation") is not None:
+            st.markdown("#### Independent check: official government empanelment (Haryana)")
+            ev = EXT["external_validation"]
+            ev = ev[ev.service == msvc]
+            if ev.empty:
+                st.caption("No PM-JAY speciality maps to this service (e.g. no MRI-specific empanelment), so no external check.")
+            else:
+                st.caption(f"Hospitals in the Virtue Foundation data were matched by name and district to Ayushman Bharat "
+                           f"PM-JAY lists published by the Haryana State Health Agency (inspected empanelment). Mapping: "
+                           f"{ev.mapping.iloc[0]}. Bars = share of flagged hospitals that are empanelled for it, with 95% "
+                           "intervals. Small samples: read the intervals, not just the bars.")
+                bars = ev[ev.empanelled_rate.notna() & (ev.n_flagged > 0)].copy()
+                bars["label"] = bars.system + "  (n=" + bars.n_flagged.astype(int).astype(str) + ")"
+                order = list(bars.label)
+                base_ = alt.Chart(bars).encode(y=alt.Y("label:N", sort=order, title=None))
+                e1, e2 = st.columns([3, 1])
+                e1.altair_chart((base_.mark_bar(color="#0969da", cornerRadiusEnd=3).encode(
+                    x=alt.X("empanelled_rate:Q", title="share empanelled for the matching speciality",
+                            axis=alt.Axis(format="%"), scale=alt.Scale(domain=[0, 1])),
+                    tooltip=["system", "n_flagged", alt.Tooltip("empanelled_rate:Q", format=".0%"),
+                             alt.Tooltip("ci95_low:Q", format=".0%"), alt.Tooltip("ci95_high:Q", format=".0%")])
+                    + base_.mark_rule(color="#1f2328").encode(x="ci95_low:Q", x2="ci95_high:Q")
+                    + alt.Chart(pd.DataFrame({"x": [ev.base_rate.iloc[0]]})).mark_rule(strokeDash=[4, 3], color="#cf222e").encode(x="x:Q")
+                    ).properties(height=28 * len(bars) + 40), use_container_width=True)
+                auc = ev[ev.system == "model score (ranking)"]
+                if len(auc) and pd.notna(auc.roc_auc.iloc[0]):
+                    e2.metric("Model vs government label (AUC)", f"{auc.roc_auc.iloc[0]:.2f}",
+                              help="0.5 = no better than chance. The model never saw these labels.")
+                e2.metric("Matched hospitals", int(ev[ev.system == "all matched hospitals"].n_flagged.iloc[0]))
+                e2.caption("Red dashed line = share of all matched hospitals (base rate).")
 
         with st.expander("Calibration and full metrics"):
             cal = MODEL["model_calibration"]
